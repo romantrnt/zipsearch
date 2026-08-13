@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+
+# Private, generated data and pre-Git historical snapshots.  These are local
+# archaeology, not part of the distributable project.
+searchtool_*/
+*.zip
+!tests/fixtures/*.zip
+results/
+temp_extract/
+pass.txt
+.env
+desktop.ini
