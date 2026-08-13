@@ -1,12 +1,14 @@
+<div align="center">
+
+[**English**](README.md) | [中文](README.zh-CN.md) | [Русский](README.ru.md)
+
 # ZipSearch
 
 **Search and inspect text and structured records inside ZIP archives without bulk extraction.**
 
-[**English**](README.md) | [中文](README.zh-CN.md) | [Русский](README.ru.md)
+<img src="docs/assets/tui.png" alt="ZipSearch TUI showing archive search results and record details" width="900">
 
-<p align="center">
-  <img src="docs/assets/tui.png" alt="ZipSearch TUI showing archive search results and record details" width="900">
-</p>
+</div>
 
 ZipSearch is a local terminal tool for searching heterogeneous collections stored in ZIP files: exports, logs, spreadsheets, SQLite databases, and nested archives. It reads archive members directly, groups results for inspection, and applies bounded resource controls instead of requiring a permanently expanded working tree.
 

@@ -1,12 +1,14 @@
+<div align="center">
+
+[English](README.md) | [**中文**](README.zh-CN.md) | [Русский](README.ru.md)
+
 # ZipSearch
 
 **无需批量解压，即可在 ZIP 归档中搜索和检查文本与结构化记录。**
 
-[English](README.md) | [**中文**](README.zh-CN.md) | [Русский](README.ru.md)
+<img src="docs/assets/tui.png" alt="ZipSearch TUI，显示归档搜索结果和记录详情" width="900">
 
-<p align="center">
-  <img src="docs/assets/tui.png" alt="ZipSearch TUI，显示归档搜索结果和记录详情" width="900">
-</p>
+</div>
 
 ZipSearch 是本地终端工具，用于检索 ZIP 文件中保存的异构数据：导出文件、日志、电子表格、SQLite 数据库和嵌套归档。它直接读取归档成员，以受控的资源使用方式提供命令行与 curses TUI 两种检查界面，而不要求先建立长期保留的解压目录树。
 
