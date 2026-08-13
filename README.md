@@ -1,14 +1,16 @@
-<div align="center">
-
-[**English**](README.md) | [中文](README.zh-CN.md) | [Русский](README.ru.md)
-
 # ZipSearch
 
 **Search and inspect text and structured records inside ZIP archives without bulk extraction.**
 
-</div>
+[**English**](README.md) | [中文](README.zh-CN.md) | [Русский](README.ru.md)
+
+<p align="center">
+  <img src="docs/assets/tui.png" alt="ZipSearch TUI showing archive search results and record details" width="900">
+</p>
 
 ZipSearch is a local terminal tool for searching heterogeneous collections stored in ZIP files: exports, logs, spreadsheets, SQLite databases, and nested archives. It reads archive members directly, groups results for inspection, and applies bounded resource controls instead of requiring a permanently expanded working tree.
+
+The keyboard-first TUI keeps the archive, member, result, and record detail in one view for fast inspection.
 
 ZipSearch is the spiritual successor to `awerpars`, an earlier project whose ideas and lessons evolved into this independent implementation.
 
