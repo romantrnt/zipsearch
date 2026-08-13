@@ -44,6 +44,11 @@ class Match:
     nested_path: tuple[str, ...] = ()
     score: int = 0
     match_type: str = "literal"
+    # Rendering evidence is produced by the search engine, not reconstructed by
+    # consumers.  Spans are offsets in ``text``; query spans are offsets in the
+    # matched source pattern.
+    text_spans: tuple[tuple[int, int], ...] = ()
+    query_spans: tuple[tuple[int, int], ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)

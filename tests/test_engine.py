@@ -168,6 +168,8 @@ def test_smart_search_normalizes_names_orders_prefixes_and_ranks(tmp_path: Path)
     smart = scan_archive(archive, options("Глеб Скрепкин", smart=True, max_matches=10))
     assert [match.match_type for match in smart.matches[:2]] == ["phrase", "all_tokens"]
     assert smart.matches[0].text == "Глеб Скрепкин"
+    assert smart.matches[0].query_spans == ((0, 4), (5, 13))
+    assert smart.matches[0].text_spans == ((0, 4), (5, 13))
     assert {match.text for match in smart.matches} >= {"Скрепкин Борис", "Глеб, другой человек"}
     prefix = scan_archive(archive, options("Скрепкин Гле", smart=True, max_matches=10))
     assert prefix.matches[0].text == "Скрепкин Глеб"
@@ -187,6 +189,32 @@ def test_smart_result_cap_keeps_late_strong_match(tmp_path: Path) -> None:
     scan = scan_archive(archive, options("Скрепкин Глеб", smart=True, max_matches=3))
     assert scan.matches[0].text == "Глеб Скрепкин"
     assert len(scan.matches) == 3
+
+
+def test_smart_match_evidence_attributes_partial_reordered_and_normalized_phone(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "evidence.zip"
+    query = "Глеб Скрепкин +79087562342"
+    write_zip(archive, {"people.txt": "Игорь Скрепкин; +7 (908) 756-23-42\nСкрепкин Глеб\n"})
+    scan = scan_archive(archive, options(query, smart=True, max_matches=10))
+    phone = next(item for item in scan.matches if item.text.startswith("Игорь"))
+    # The unmatched name is absent, while both independently matching query
+    # components remain attributable even though phone has the highest score.
+    assert phone.query_spans == ((5, 13), (14, 26))
+    assert phone.text_spans == ((6, 14), (17, 34))
+    reordered = next(item for item in scan.matches if item.text == "Скрепкин Глеб")
+    assert reordered.query_spans == ((0, 4), (5, 13))
+    assert reordered.text_spans == ((0, 8), (9, 13))
+
+
+def test_literal_and_regex_match_evidence_uses_actual_match_spans(tmp_path: Path) -> None:
+    archive = tmp_path / "evidence-modes.zip"
+    write_zip(archive, {"people.txt": "before NEEDLE after\n"})
+    literal = scan_archive(archive, options("needle", max_matches=10)).matches[0]
+    regex = scan_archive(archive, options(r"NE+DL[E]", regex=True, max_matches=10)).matches[0]
+    assert literal.text_spans == ((7, 13),) and literal.query_spans == ((0, 6),)
+    assert regex.text_spans == ((7, 13),) and regex.query_spans == ((0, 8),)
 
 
 def test_literal_search_remains_contiguous_and_order_sensitive(tmp_path: Path) -> None:

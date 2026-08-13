@@ -1,160 +1,239 @@
+<div align="center">
+
+[**English**](README.md) | [中文](README.zh-CN.md) | [Русский](README.ru.md)
+
 # ZipSearch
 
-ZipSearch is a fast command-line search tool for large collections of ZIP archives. It searches files *inside* ZIPs directly, so you can inspect thousands of archives without first expanding them into a huge temporary tree.
+**Search and inspect text and structured records inside ZIP archives without bulk extraction.**
 
-It is useful for data engineering, incident response, archives, exports, backups, and any collection where the archive boundary should not get in the way of a search.
+</div>
 
-## Two first-class interfaces
+ZipSearch is a local terminal tool for searching heterogeneous collections stored in ZIP files: exports, logs, spreadsheets, SQLite databases, and nested archives. It reads archive members directly, groups results for inspection, and applies bounded resource controls instead of requiring a permanently expanded working tree.
 
-For interactive work, launch the terminal application:
+ZipSearch is the spiritual successor to `awerpars`, an earlier project whose ideas and lessons evolved into this independent implementation.
 
-```console
-zipsearch
-# or: zipsearch tui ./archives
-```
+## Why it exists
 
-It opens with an editable `query>` prompt, streams grouped archive/member matches into a navigable table, highlights matches, and shows detail, progress, errors, and export controls. It is deliberately terminal-aware: a bare `zipsearch` never opens an interactive screen when standard input or output is piped.
+Large archive collections are awkward to inspect by hand. Expanding every archive just to locate a value duplicates storage, costs I/O, and leaves cleanup work behind. ZipSearch discovers ZIPs, reads eligible members, and exposes the resulting records through both a command-line interface and a curses TUI.
 
-For scripts and pipelines, use the stable command interface:
+> ZipSearch does decompress data while reading it. “Without bulk extraction” means it does not expand an archive collection into a persistent directory tree. Some handlers use automatically removed temporary storage; see [Storage behavior](#storage-behavior).
 
-```console
-zipsearch search ./archives "Иван Соколов" --regex -j 4 --jsonl
-zipsearch inspect evidence.zip --json
-```
+## At a glance
 
-`search` and `inspect` retain their existing behaviour; the TUI is a separate presentation layer over the same engine.
-
-### TUI keys
-
-| Key | Action |
+| Area | What ZipSearch provides |
 | --- | --- |
-| `/` | Focus the query field |
-| `Enter` | Start search, or inspect selected result |
-| `r` | Change search root without restarting |
-| `m` | Cycle SMART → LITERAL → REGEX search modes |
-| `f` | Open filters and advanced safety controls |
-| `↑`/`↓`, `j`/`k`, PgUp/PgDn, Home/End | Navigate virtualized results |
-| `x` | Inspect recoverable errors |
-| `e` | Export current results as JSONL, CSV, and text |
-| `Ctrl+C` | Cancel the current UI result stream |
-| `q` / `?` | Quit / built-in shortcut help |
-
-Use comma-separated patterns in the search field for multi-pattern search. SMART is the TUI default: it normalizes Unicode/case/whitespace/punctuation and ranks exact phrases, all-token records in either order, safe token prefixes, then individual-token matches. It is not edit-distance fuzzy search. LITERAL and REGEX retain their explicit predictable semantics. The root prompt accepts directories, a single `.zip`, relative paths, and `~`; changing it preserves query/settings but clears stale results.
-
-The Filters dialog exposes extensions, include/exclude globs, encoding, context, nested depth, result cap, worker count, and the engine’s archive safety limits. Regex is validated before a scan starts.
-
-The TUI is implemented with Python's standard `curses` layer, so the search engine and CLI remain free of UI dependencies. It uses terminal attributes (reverse, bold, underline) rather than a hard-coded truecolor theme; it is therefore usable in monochrome and limited-color terminals. JSONL is always uncolored.
+| Search | Literal, regular-expression, and normalized token-aware SMART search |
+| Data | Text-like members, SQLite rows, XLSX worksheet rows, nested ZIPs |
+| Inspection | Archive → member → result tree; detail panel; central-directory inspection |
+| Operations | Include/exclude globs, extension filters, context, root switching, export, cancellation |
+| Controls | Member/count/expanded-size/compression-ratio/nesting limits; recoverable issue reporting |
 
 ## Install
 
-Requires Python 3.10 or later.
+Python **3.10 or newer** is required. ZipSearch has no runtime third-party dependencies.
 
 ```console
 python -m pip install .
+zipsearch --version
 ```
 
-For development:
+For a checkout used during development:
 
 ```console
 python -m pip install -e . pytest ruff
-pytest
-ruff check .
 ```
+
+Running `zipsearch` with no arguments opens the TUI only when both standard input and output are terminals. In scripts, use an explicit subcommand.
 
 ## Quick start
 
-Search one archive:
-
 ```console
-zipsearch search evidence.zip "customer@example.com"
-```
+# Interactive TUI, rooted at a directory or one ZIP file
+zipsearch tui ./archives
 
-Search every ZIP below a directory with four bounded workers:
+# Ordinary literal search (case-insensitive by default)
+zipsearch search ./archives 'customer@example.com'
 
-```console
-zipsearch search ./archives "invoice-2025" -j 4
-```
+# SMART: punctuation/case/word-order-aware human search
+zipsearch search ./archives 'Глеб Скрепкин +79087562342' --smart
 
-Use the optional ranked human-search mode without changing ordinary CLI semantics:
-
-```console
-zipsearch search ./archives "Глеб Скрепкин" --smart
-```
-
-Search several terms, only in CSV and JSON members, with path filters:
-
-```console
-zipsearch search ./archives alice@example.com "account closed" \
-  --extension csv --extension json --include 'exports/**' --exclude '*backup*'
-```
-
-Regular expressions, context, and machine-readable output:
-
-```console
+# Regex, context lines, and JSON Lines output
 zipsearch search ./archives 'INV-[0-9]{8}' --regex -C 2 --jsonl > matches.jsonl
-```
 
-Inspect the central directory of an archive without decompressing members:
+# Limit eligible member paths and extensions
+zipsearch search ./archives needle --extension csv --extension json \
+  --include 'exports/**' --exclude '*backup*'
 
-```console
+# Read only an archive central directory; do not decompress members
 zipsearch inspect evidence.zip --json
 ```
 
-Run `zipsearch search --help` for the complete command reference.
+Run `zipsearch search --help` for the complete CLI reference.
 
-## What it searches
+## Search semantics
 
-By default ZipSearch scans line-oriented text and common structured-text extensions: TXT, CSV/TSV, logs, JSON/JSONL, XML, HTML, Markdown, YAML, INI/config files, and the historical project's DAT/TAD/CPY formats. It also searches SQLite rows and XLSX worksheet values. Legacy `.xls` is deliberately not decoded because it requires a large optional parser and is unsafe to guess from raw binary; convert it to XLSX or CSV first.
+| Mode | Selection rule | Ordering |
+| --- | --- | --- |
+| **LITERAL** | Each pattern is an escaped, contiguous regular-expression search. Multi-word order matters. | Archive/member/line scan order, subject to the global cap. |
+| **REGEX** | Each pattern is compiled as a Python regular expression. | Archive/member/line scan order, subject to the global cap. |
+| **SMART** | Normalized phrase, token, prefix, and phone evidence are considered for each query pattern. | Stronger evidence ranks first globally. |
 
-The historical tool's useful capabilities are retained in a scriptable form: recursive discovery, multiple literal patterns, regex search, case controls, member include/exclude globs, extension filtering, result grouping by archive/member path, result limits, structured JSONL output, and SQLite/XLSX handling.
+LITERAL is the CLI default; SMART is the TUI default. `--smart` and `--regex` are mutually exclusive. Searches are case-insensitive unless `--case-sensitive` is selected; `--ignore-case` explicitly selects the default.
 
-Nested ZIP members are supported up to depth 2 by default. Their source appears as `outer.zip:inner.zip!file.txt:line`. Set `--nested-depth 0` to disable this.
+### SMART matching
 
-## Output and exit behavior
+SMART normalizes Unicode with NFKC, folds case (and Russian `ё` to `е` when case-insensitive), treats punctuation as separators, and collapses whitespace. It does not use edit distance or spelling guesses.
 
-Human output is one match per line:
+For a multi-token pattern, SMART ranks normalized phrase matches first, then records containing all tokens in any order, then safe token-prefix matches, then useful partial-token matches. A record may remain in the result set when only part of a multi-token query matched. For phone-shaped query components of at least seven digits, separators are ignored and Russian `8xxxxxxxxxx` is normalized to `7xxxxxxxxxx`.
+
+For example, `Глеб Скрепкин +79087562342` can match `Игорь Скрепкин; +7 (908) 756-23-42`. The matching evidence is `Скрепкин` and the phone number; `Глеб` remains visible in the query but is not treated as evidence.
+
+`match_type` and `score` appear in JSONL output and result-detail inspection. A score is an internal ordering signal, not a percentage or a cross-query relevance measure.
+
+## TUI
+
+`zipsearch tui [PATH]` opens a keyboard-first interface with an editable query line, a RESULTS pane, a DETAIL pane, and a compact status/footer area.
+
+- **RESULTS** is a tree: archive → member → matching record. Archive and member nodes can be collapsed without changing the loaded result set, ranking, or search.
+- **DETAIL** shows the selected record, including the full original `matched` query and only the query components that contributed to that result. It also renders available archive/member metadata when a tree node is selected.
+- Match evidence is underlined and may receive one restrained terminal accent color when curses color support is available. Monochrome terminals retain attribute-based highlighting. The selected row remains reverse-video.
+- The status line reports archive/member counts, hits, issues, workers, nesting depth, **S** (current or last search duration), and **U** (continuously increasing TUI uptime).
+
+### Keyboard reference
+
+| Key | Action |
+| --- | --- |
+| <kbd>/</kbd> | Focus/edit the query |
+| <kbd>Enter</kbd> | Run the query; when browsing, inspect the selected tree node or result |
+| <kbd>↑</kbd>/<kbd>↓</kbd>, <kbd>j</kbd>/<kbd>k</kbd> | Navigate results; while editing, browse query history |
+| <kbd>PgUp</kbd>/<kbd>PgDn</kbd>, <kbd>Home</kbd>/<kbd>End</kbd> | Navigate results |
+| <kbd>Space</kbd> | Toggle selected archive/member node |
+| <kbd>←</kbd> / <kbd>→</kbd> | Collapse / expand selected archive/member node |
+| <kbd>r</kbd> | Change root (directory or `.zip`) |
+| <kbd>m</kbd> | Cycle SMART → LITERAL → REGEX |
+| <kbd>c</kbd> | Toggle case sensitivity |
+| <kbd>f</kbd> | Open filters and limits |
+| <kbd>x</kbd> | Show recoverable issues |
+| <kbd>e</kbd> | Export current results as JSONL, CSV, and text files |
+| <kbd>Ctrl-C</kbd> | Cancel an active search |
+| <kbd>?</kbd> / <kbd>q</kbd> | Help / quit |
+
+Comma-separated TUI query components become separate patterns. Root changes preserve the query and settings but discard stale results. Query history is bounded by the entries accumulated in the session and returns to the current editable draft after the newest entry.
+
+## Data and archive support
+
+| Category | Supported input | Handling |
+| --- | --- | --- |
+| Container | `.zip` | Direct root archive or recursive directory discovery; nested ZIP members up to configured depth |
+| Text-like members | `.txt`, `.csv`, `.tsv`, `.log`, `.json`, `.jsonl`, `.xml`, `.html`, `.htm`, `.md`, `.rst`, `.yaml`, `.yml`, `.ini`, `.cfg`, `.conf`, `.dat`, `.tad`, `.cpy` | Line-oriented decoding and search |
+| SQLite | `.db`, `.sqlite`, `.sqlite3` | Read-only table rows rendered as searchable records |
+| XLSX | `.xlsx` | Worksheet XML rows and shared strings rendered as searchable records |
+
+By default, members outside those extensions are skipped. `--extension EXT` selects extensions explicitly; extension, include, and exclude filters are applied to member paths. Text decoding is `auto`: UTF-8 when possible, otherwise CP1251; pass `--encoding CODEC` when the source encoding is known. A NUL byte in the initial text probe causes the member to be skipped as binary.
+
+Nested ZIP paths are shown with `!`, for example `outer.zip:inner.zip!records.txt:42` in CLI output.
+
+## CLI options and limits
+
+### Common search controls
+
+| Option | Default | Meaning |
+| --- | ---: | --- |
+| `--max-matches` | `1000` | Global output/result cap |
+| `-C`, `--context` | `0` | Lines shown before and after a matched text record |
+| `--encoding` | `auto` | `auto` or any Python codec name |
+| `-j`, `--workers` | `4` | Archive worker threads |
+| `--nested-depth` | `2` | Nested ZIP depth; `0` disables nested ZIP traversal |
+| `--include GLOB` | — | Require a matching member path or basename; repeatable |
+| `--exclude GLOB` | — | Skip matching member paths or basenames; repeatable |
+| `--extension EXT` | — | Scan only selected extension(s); repeatable |
+| `--no-recursive` | off | Do not descend below the input directory |
+| `--jsonl` | off | Write match objects and final summary as JSON Lines |
+| `-q`, `--quiet` | off | Suppress human summary and warnings |
+
+### Resource limits
+
+| Option | Default | Checked before member decompression |
+| --- | ---: | --- |
+| `--max-member-mib` | `512` MiB | Declared size of one member |
+| `--max-total-mib` | `2048` MiB | Declared expanded size of an archive |
+| `--max-members` | `100000` | Entries in one archive |
+| `--max-ratio` | `200.0` | Declared compression ratio of a member |
+
+The TUI exposes equivalent settings: extensions, include/exclude globs, encoding, context, nesting depth, workers, cap, and the same safety limits.
+
+## Output, export, and failure handling
+
+Human CLI matches are written as `archive:member:line: text`; context lines use `-` and `+`. `--jsonl` emits a JSON object per match followed by one summary object. Human diagnostics and summaries are written to standard error. The TUI export command writes timestamped `.jsonl`, `.csv`, and `.txt` files in the current working directory.
+
+Malformed archives, unreadable/unsupported members, decoding or parser failures, unsafe paths, encrypted members, and limit violations are reported as recoverable issues where possible; unrelated archives continue scanning. CLI exit status is `0` without issues, `1` when recoverable issues occurred, `2` for invalid configuration, and `130` after Ctrl-C.
+
+## Storage behavior
+
+ZipSearch never calls `extractall`. Ordinary text members are opened from the archive and read incrementally. SQLite requires random access, so that member alone is copied to an automatically removed temporary directory and opened read-only. XLSX and nested ZIP processing use spooled temporary files that remain in memory up to 8 MiB before using the system temporary area. Archive metadata shown by `inspect` comes from the central directory and does not decompress members.
+
+## How it works
 
 ```text
-/data/batch/a.zip:exports/users.csv:42: alice@example.com,active
+root path → deterministic ZIP discovery → bounded archive workers
+         → central-directory safety checks → member decoder/parser
+         → LITERAL / REGEX / SMART matching and evidence attribution
+         → Match records → CLI rendering, JSONL, or TUI tree/detail/export
 ```
 
-`--jsonl` writes match objects and one final summary object to standard output, making it suitable for pipelines. Diagnostics and the normal final summary go to standard error. A damaged archive is reported and does not stop the rest of the collection. Exit status is zero for a completed scan with no archive/member errors, one when recoverable errors occurred, two for invalid command configuration, and 130 for Ctrl-C.
+Directory discovery does not follow directory symlinks. Archive scanning uses a fixed-size thread pool and keeps at most two worker windows queued. SMART results are retained and ranked with a bounded top-N process so stronger later matches can displace weaker earlier ones.
 
-## Safety and resource model
+## Performance
 
-ZipSearch never calls `extractall`. Normal members are opened with `ZipFile.open()` and scanned incrementally. SQLite is the only built-in handler requiring random access; only that member is copied to an isolated `TemporaryDirectory`, opened read-only, and removed even if parsing fails. XLSX and nested ZIP handling use an automatically removed spooled temporary file, which remains in memory only up to 8 MiB and then uses the system temporary area.
-
-Before decompressing, ZipSearch checks the central directory. Defaults reject archives with more than 100,000 members, members larger than 512 MiB, total declared expansion above 2 GiB, or a member compression ratio over 200:1. Unsafe member paths, encrypted members, and excessive nesting are skipped and reported. Tune these only when you trust the input:
+Speed depends on archive count, compressed and expanded sizes, member formats, storage latency, query mode, filters, compression ratio, and worker count. The repository includes a small reproducible smoke benchmark; it is not a performance claim:
 
 ```console
-zipsearch search ./trusted-exports needle --max-member-mib 1024 --max-total-mib 8192
+python benchmarks/benchmark.py
 ```
 
-Archive concurrency uses a fixed-size thread pool (four workers by default) and keeps at most two worker windows queued. This is a deliberate fit for mixed disk I/O, ZIP decompression, and text scanning; it avoids the abandoned project's unbounded all-data index and excessive process creation. Results are emitted as archives finish, with a global output cap (default 1,000).
-
-## Limitations
-
-Only ZIP is supported in this release. RAR and 7z were experimental in the historical scripts and depended on external native tools; they are intentionally excluded instead of presenting unreliable support. Password-protected ZIP members are reported as skipped; passwords are not read from ad-hoc files. Search defaults to `--encoding auto` (UTF-8, then CP1251 for legacy Russian exports); use an explicit Python codec when the encoding is known. Binary members are skipped when an early NUL byte is detected.
-
-ZIP metadata is attacker-controlled. Safety checks reduce risk but are not a substitute for running untrusted content with normal OS-level isolation.
-
-## Development and release
-
-The test suite creates deterministic ZIP fixtures at runtime—no real databases, archives, password files, or personal data are committed. CI tests Python 3.10–3.12, package installation, and Ruff. The historical pre-Git snapshots are intentionally ignored by `.gitignore`; they were used as local archaeology and are not part of the distributable source tree.
-
-This project is licensed under the [MIT License](LICENSE).
-
-## Reproducible realistic dataset
-
-For a disposable five-archive stress dataset made entirely from fixed-seed fictional Russian institutional records, run:
+For a generated functional dataset exercised through the public CLI:
 
 ```console
 python benchmarks/validate_realistic_dataset.py
 ```
 
-It creates or refreshes the deliberately external sibling dataset at
-`../testdata/realistic/`, runs the public CLI through literal, regex,
-multi-pattern, format-filtered, nested-ZIP, JSONL, and concurrent searches,
-checks expected match counts, and confirms temporary cleanup. The generated ZIPs
-are never repository artifacts. To generate without validation, use
-`python benchmarks/generate_realistic_dataset.py`.
+<details>
+<summary>Operational notes</summary>
+
+Use extension/include/exclude filters to avoid decoding irrelevant members. Increasing `--workers` may help across many archives on suitable storage, but it also increases concurrent I/O and decompression. Treat raised size/ratio limits as a trust decision for the input collection.
+
+</details>
+
+## Limitations
+
+- ZIP is the only archive container supported.
+- Encrypted ZIP members are skipped; password input is not implemented.
+- XLSX handling reads worksheet values, not workbook formatting or formulas as a spreadsheet application would.
+- SQLite and XLSX processing create temporary data as described above.
+- Text auto-detection is intentionally limited to UTF-8 then CP1251; use `--encoding` for other known encodings.
+- Safety checks reduce exposure to hostile archives but do not replace operating-system isolation for untrusted input.
+
+## Development
+
+```console
+python -m pip install -e . pytest ruff build
+pytest
+ruff check .
+python -m build
+```
+
+Continuous integration runs the test suite and Ruff on Python 3.10, 3.11, and 3.12. See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidance.
+
+## Repository layout
+
+```text
+src/zipsearch/        package: engine, search modes, CLI, renderer, TUI
+tests/                engine, CLI, controller, and PTY TUI coverage
+benchmarks/           reproducible smoke and generated-dataset checks
+CONTRIBUTING.md       contribution guidance
+LICENSE               MIT license
+```
+
+## License
+
+Released under the [MIT License](LICENSE).

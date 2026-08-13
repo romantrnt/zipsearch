@@ -10,13 +10,13 @@ import queue
 import re
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 from .engine import SearchConfigurationError, discover_archives, rank_matches, scan_archives
 from .models import ArchiveScan, Issue, Match, SafetyLimits, SearchOptions, Summary
-from .smart import tokens as smart_tokens
 
 
 def _patterns(value: str) -> tuple[str, ...]:
@@ -35,6 +35,9 @@ class Row:
     kind: str
     text: str
     match: Match | None = None
+    archive: str = ""
+    member: str = ""
+    nested_path: tuple[str, ...] = ()
 
 
 class SearchSession:
@@ -89,16 +92,25 @@ class ZipSearchTui:
         self.issues: list[Issue] = []
         self.summary = Summary()
         self.rows: list[Row] = []
+        self.collapsed_archives: set[str] = set()
+        self.collapsed_members: set[tuple[str, str, tuple[str, ...]]] = set()
+        self.archive_scans: dict[str, ArchiveScan] = {}
         self.selected = 0
         self.offset = 0
-        self.started = 0.0
+        self.session_started = time.perf_counter()
+        self.search_started: float | None = None
+        self.search_elapsed = 0.0
         self.overlay: str | None = None
         self.filter_index = 0
         self.history: list[str] = []
         self.history_index: int | None = None
+        self.history_draft: str | None = None
         self.root_history: list[Path] = [self.root]
         self.root_history_index: int | None = None
         self.root_buffer = str(self.root)
+        self.active_query = ""
+        self.color_attr = 0
+        self._colors_initialized = False
         self.settings: list[list[str]] = [
             ["extensions", ""],
             ["include glob", ""],
@@ -157,19 +169,35 @@ class ZipSearchTui:
             return
         if self.query not in self.history:
             self.history.append(self.query)
+        self.active_query = self.query
         self.history_index = None
         self.results, self.issues, self.rows = [], [], []
+        self.collapsed_archives, self.collapsed_members, self.archive_scans = set(), set(), {}
         self.summary, self.selected, self.offset = Summary(), 0, 0
-        self.started, self.state, self.message = (
-            time.perf_counter(),
-            "SEARCHING",
-            "Scanning archives…",
-        )
+        self.search_started = time.perf_counter()
+        self.search_elapsed = 0.0
+        self.state, self.message = "SEARCHING", "Scanning archives…"
         self.generation = self.session.start(self.root, self.options)
+
+    def search_duration(self) -> float:
+        """Return the live duration of an active search or its final frozen value."""
+        if self.search_started is None:
+            return self.search_elapsed
+        return time.perf_counter() - self.search_started
+
+    def session_uptime(self) -> float:
+        """Return the TUI lifetime; it intentionally never resets between searches."""
+        return time.perf_counter() - self.session_started
+
+    def _freeze_search_duration(self) -> None:
+        if self.search_started is not None:
+            self.search_elapsed = time.perf_counter() - self.search_started
+            self.search_started = None
 
     def cancel(self) -> None:
         if self.state == "SEARCHING":
             self.session.cancel()
+            self._freeze_search_duration()
             self.state, self.message = "CANCELLED", "Search cancelled; safe cleanup in progress."
 
     def apply_root(self, value: str) -> bool:
@@ -187,6 +215,8 @@ class ZipSearchTui:
         if not candidate.is_dir() and not candidate.is_file():
             self.message = f"Invalid root: {candidate} is not searchable"
             return False
+        if self.state == "SEARCHING":
+            self._freeze_search_duration()
         self.session.cancel()
         self.generation = -1
         self.root = candidate
@@ -195,6 +225,7 @@ class ZipSearchTui:
             self.root_history.append(candidate)
         self.root_history_index = None
         self.results, self.issues, self.rows = [], [], []
+        self.collapsed_archives, self.collapsed_members, self.archive_scans = set(), set(), {}
         self.summary, self.selected, self.offset = Summary(), 0, 0
         self.state, self.message = "IDLE", "Root changed. Press Enter to search this root."
         return True
@@ -216,6 +247,7 @@ class ZipSearchTui:
                 self.summary.members_seen += scan.members_seen
                 self.summary.members_scanned += scan.members_scanned
                 self.issues.extend(scan.issues)
+                self.archive_scans[str(scan.archive)] = scan
                 if self.options.smart:
                     self.results.extend(scan.matches)
                     if len(self.results) > self.options.max_matches * 2:
@@ -225,17 +257,20 @@ class ZipSearchTui:
                     self.results.extend(scan.matches[:remaining])
                 self._rebuild_rows()
             elif kind == "error":
+                self._freeze_search_duration()
                 self.state, self.message = "ERROR", str(payload)
             else:
                 if self.state == "SEARCHING":
                     if self.options.smart:
                         self.results = rank_matches(iter(self.results), self.options.max_matches)
                         self._rebuild_rows()
+                    self._freeze_search_duration()
                     self.state = "COMPLETE"
                     self.message = "No matches." if not self.results else "Search complete."
         self.summary.matches, self.summary.issues = len(self.results), len(self.issues)
 
     def _rebuild_rows(self) -> None:
+        selected_key = self._row_key(self.selected_row())
         rows: list[Row] = []
         groups: dict[tuple[str, str, tuple[str, ...]], list[Match]] = {}
         for match in self.results:
@@ -250,26 +285,79 @@ class ZipSearchTui:
         previous_archive = None
         for (archive, member, nested_path), matches in ordered_groups:
             if archive != previous_archive:
-                rows.append(Row("archive", Path(archive).name))
+                rows.append(Row("archive", Path(archive).name, archive=archive))
                 previous_archive = archive
+            if archive in self.collapsed_archives:
+                continue
             display_member = " ! ".join((*nested_path, member))
-            rows.append(Row("member", display_member))
+            member_key = (archive, member, nested_path)
+            rows.append(
+                Row(
+                    "member",
+                    display_member,
+                    archive=archive,
+                    member=member,
+                    nested_path=nested_path,
+                )
+            )
+            if member_key in self.collapsed_members:
+                continue
             matches.sort(
                 key=lambda match: (
                     (-match.score, match.line) if self.options.smart else (match.line,)
                 )
             )
-            rows.extend(Row("match", match.text, match) for match in matches)
+            rows.extend(
+                Row("match", match.text, match, archive, member, nested_path) for match in matches
+            )
         self.rows = rows
-        if self.selected >= len(rows):
+        restored = next(
+            (index for index, row in enumerate(rows) if self._row_key(row) == selected_key), None
+        )
+        if restored is not None:
+            self.selected = restored
+        elif self.selected >= len(rows):
             self.selected = max(0, len(rows) - 1)
-        if rows and self.selected == 0 and rows[0].kind != "match":
+        if selected_key is None and rows and self.selected == 0 and rows[0].kind != "match":
             self.selected = next((index for index, row in enumerate(rows) if row.match), 0)
 
     def selected_match(self) -> Match | None:
         if 0 <= self.selected < len(self.rows):
             return self.rows[self.selected].match
         return None
+
+    def selected_row(self) -> Row | None:
+        return self.rows[self.selected] if 0 <= self.selected < len(self.rows) else None
+
+    @staticmethod
+    def _row_key(row: Row | None) -> tuple[object, ...] | None:
+        if row is None:
+            return None
+        return (
+            row.kind,
+            row.archive,
+            row.member,
+            row.nested_path,
+            row.match.line if row.match else None,
+        )
+
+    def _toggle_tree(self, expand: bool | None = None) -> None:
+        row = self.selected_row()
+        if row is None or row.kind == "match":
+            return
+        target = self.collapsed_archives if row.kind == "archive" else self.collapsed_members
+        key: str | tuple[str, str, tuple[str, ...]] = (
+            row.archive if row.kind == "archive" else (row.archive, row.member, row.nested_path)
+        )
+        if expand is True:
+            target.discard(key)
+        elif expand is False:
+            target.add(key)
+        elif key in target:
+            target.remove(key)
+        else:
+            target.add(key)
+        self._rebuild_rows()
 
     def export(self) -> str:
         if not self.results:
@@ -290,6 +378,7 @@ class ZipSearchTui:
         return f"Exported {len(self.results)} results: {base.name}.{{jsonl,csv,txt}}"
 
     def draw(self, screen: curses.window) -> None:
+        self._init_colors()
         height, width = screen.getmaxyx()
         screen.erase()
         if height < 12 or width < 50:
@@ -310,17 +399,23 @@ class ZipSearchTui:
             curses.A_REVERSE if self.editing else curses.A_BOLD,
         )
         split = max(34, width * 3 // 5)
-        for y in range(3, height - 3):
-            self._safe_add(screen, y, split, "│")
         self._safe_add(screen, 2, 2, " RESULTS ", curses.A_BOLD)
         self._safe_add(screen, 2, split + 2, " DETAIL ", curses.A_BOLD)
         self._draw_results(screen, 3, 1, split - 2, height - 7)
         self._draw_detail(screen, 3, split + 2, width - split - 3, height - 7)
-        elapsed = time.perf_counter() - self.started if self.started else 0
+        # Pane content is always clipped, but redraw this structural boundary last
+        # as well: terminals may render a wide glyph differently from Python's
+        # code-point indexing.
+        self._draw_divider(screen, split, 3, height - 3)
+        search_duration = self.search_duration()
+        session_uptime = self.session_uptime()
         cap = " CAP" if len(self.results) >= self.options.max_matches else ""
         archives = f"A:{self.summary.archives_completed}/{self.summary.archives_seen}"
         members = f"M:{self.summary.members_scanned}/{self.summary.members_seen}"
-        runtime = f"E:{len(self.issues)} {elapsed:5.1f}s J:{self.options.workers}"
+        runtime = (
+            f"E:{len(self.issues)} S:{search_duration:5.1f}s "
+            f"U:{session_uptime:5.1f}s J:{self.options.workers}"
+        )
         hits = f"H:{len(self.results)}{cap}"
         status = f" {self.state:<10} {archives} {members} {hits} {runtime}"
         status += f" D:{self.options.limits.max_nested_depth} "
@@ -339,6 +434,10 @@ class ZipSearchTui:
             self._draw_overlay(screen, height, width)
         screen.refresh()
 
+    def _draw_divider(self, screen: curses.window, x: int, top: int, bottom: int) -> None:
+        for y in range(top, bottom):
+            self._safe_add(screen, y, x, "│")
+
     def _draw_results(
         self, screen: curses.window, top: int, left: int, width: int, rows: int
     ) -> None:
@@ -350,74 +449,129 @@ class ZipSearchTui:
             row = self.rows[index]
             attr = curses.A_REVERSE if index == self.selected else 0
             if row.kind == "archive":
-                self._safe_add(
-                    screen, top + visual, left, "▾ " + row.text[: width - 2], attr | curses.A_BOLD
+                marker = "▸" if row.archive in self.collapsed_archives else "▾"
+                self._safe_add_clipped(
+                    screen,
+                    top + visual,
+                    left,
+                    marker + " " + row.text,
+                    attr | curses.A_BOLD,
+                    width,
                 )
             elif row.kind == "member":
-                self._safe_add(
+                key = (row.archive, row.member, row.nested_path)
+                marker = "▸" if key in self.collapsed_members else "▾"
+                self._safe_add_clipped(
                     screen,
                     top + visual,
                     left + 2,
-                    "› " + row.text[: width - 4],
+                    marker + " " + row.text,
                     attr | curses.A_DIM,
+                    width - 2,
                 )
             else:
                 prefix = f"  {row.match.line:>6} " if row.match else ""
-                self._safe_add(screen, top + visual, left + 2, prefix, attr)
+                text_left = left + 2
+                self._safe_add_clipped(screen, top + visual, text_left, prefix, attr, width - 2)
                 self._draw_highlight(
                     screen,
                     top + visual,
-                    left + 2 + len(prefix),
-                    row.text,
-                    width - len(prefix) - 4,
+                    text_left + self._cell_width(prefix),
+                    row.match,
+                    width - 2 - self._cell_width(prefix),
                     attr,
                 )
 
+    def _init_colors(self) -> None:
+        """Add one optional match accent without assuming a terminal background."""
+        if self._colors_initialized:
+            return
+        self._colors_initialized = True
+        try:
+            if not curses.has_colors():
+                return
+            curses.start_color()
+            curses.use_default_colors()
+            curses.init_pair(1, curses.COLOR_CYAN, -1)
+            self.color_attr = curses.color_pair(1)
+        except curses.error:
+            self.color_attr = 0
+
     def _draw_highlight(
-        self, screen: curses.window, y: int, x: int, text: str, width: int, base: int
+        self, screen: curses.window, y: int, x: int, match: Match | None, width: int, base: int
     ) -> None:
-        text = text[: max(0, width)]
-        spans: list[tuple[int, int]] = []
-        flags = 0 if self.options.case_sensitive else re.IGNORECASE
-        patterns = (
-            tuple(token for pattern in self.options.patterns for token in smart_tokens(pattern))
-            if self.options.smart
-            else self.options.patterns
-        )
-        for pattern in patterns:
-            try:
-                spans.extend(
-                    (match.start(), match.end())
-                    for match in re.finditer(
-                        pattern if self.options.regex else re.escape(pattern), text, flags
-                    )
-                )
-            except re.error:
-                continue
+        if not match:
+            return
+        self._draw_spans(screen, y, x, match.text, width, base, match.text_spans)
+
+    def _draw_spans(
+        self, screen: curses.window, y: int, x: int, text: str, width: int, base: int,
+        spans: tuple[tuple[int, int], ...],
+    ) -> None:
+        x_offset = 0
         for index, char in enumerate(text):
+            cell_width = self._cell_width(char)
+            if x_offset + cell_width > max(0, width):
+                break
             attr = base | (
-                curses.A_BOLD | curses.A_UNDERLINE if any(a <= index < b for a, b in spans) else 0
+                curses.A_BOLD | curses.A_UNDERLINE | self.color_attr
+                if any(start <= index < end for start, end in spans) else 0
             )
-            self._safe_add(screen, y, x + index, char, attr)
+            self._safe_add(screen, y, x + x_offset, char, attr)
+            x_offset += cell_width
+
+    def _query_spans(self, match: Match, query: str) -> tuple[tuple[int, int], ...]:
+        """Translate engine offsets in a source pattern to the original query line."""
+        if not match.patterns:
+            return ()
+        remaining = list(re.finditer(r"[^,]+", query))
+        result: list[tuple[int, int]] = []
+        if len(match.patterns) == 1:
+            source = match.patterns[0]
+            for piece in remaining:
+                leading = len(piece.group()) - len(piece.group().lstrip())
+                if piece.group().strip() == source:
+                    return tuple(
+                        (piece.start() + leading + start, piece.start() + leading + end)
+                        for start, end in match.query_spans
+                    )
+            return ()
+        # SMART has one winning pattern.  Literal/regex may have several;
+        # their corresponding source-local spans are retained in order.
+        for source, source_span in zip(match.patterns, match.query_spans, strict=False):
+            for index, piece in enumerate(remaining):
+                leading = len(piece.group()) - len(piece.group().lstrip())
+                if piece.group().strip() == source:
+                    result.append(
+                        (
+                            piece.start() + leading + source_span[0],
+                            piece.start() + leading + source_span[1],
+                        )
+                    )
+                    remaining.pop(index)
+                    break
+        return tuple(result)
 
     def _draw_detail(
         self, screen: curses.window, top: int, left: int, width: int, height: int
     ) -> None:
-        match = self.selected_match()
-        if not match:
+        row = self.selected_row()
+        match = row.match if row else None
+        if row is None:
             lines = [
                 self.message,
                 "",
                 "Select a result with j/k or arrows.",
                 "Press f for filters; ? for keys.",
             ]
-        else:
+        elif match:
             member = " ! ".join((*match.nested_path, match.member))
+            query = self.active_query or self.query
             lines = [
                 f"archive  {Path(match.archive).name}",
                 f"member   {member}",
                 f"line     {match.line}",
-                f"matched  {', '.join(match.patterns)}",
+                "matched  " + query,
                 "",
                 "record",
                 match.text,
@@ -426,8 +580,67 @@ class ZipSearchTui:
                 lines += ["", "before"] + list(match.context_before)
             if match.context_after:
                 lines += ["", "after"] + list(match.context_after)
+        else:
+            lines = self._node_detail_lines(row)
         for index, line in enumerate(lines[:height]):
-            self._safe_add(screen, top + index, left, line[:width])
+            if match and index == 3:
+                prefix = "matched  "
+                self._safe_add_clipped(screen, top + index, left, prefix, 0, width)
+                self._draw_spans(
+                    screen,
+                    top + index,
+                    left + self._cell_width(prefix),
+                    query,
+                    width - self._cell_width(prefix),
+                    0,
+                    self._query_spans(match, query),
+                )
+            elif match and index == 6:
+                self._draw_spans(screen, top + index, left, line, width, 0, match.text_spans)
+            else:
+                self._safe_add_clipped(screen, top + index, left, line, 0, width)
+
+    def _node_detail_lines(self, row: Row) -> list[str]:
+        if row.kind == "archive":
+            scan = self.archive_scans.get(row.archive)
+            path = Path(row.archive)
+            try:
+                size = path.stat().st_size
+            except OSError:
+                size = None
+            members = len(
+                {
+                    (candidate.member, candidate.nested_path)
+                    for candidate in self.results
+                    if candidate.archive == row.archive
+                }
+            )
+            lines = [
+                f"archive  {path.name}",
+                f"path     {row.archive}",
+                "type     ZIP archive",
+                f"size     {size} bytes" if size is not None else "size     unavailable",
+                f"members  {scan.members_seen if scan else members}",
+                f"results  {sum(match.archive == row.archive for match in self.results)}",
+            ]
+            if scan:
+                lines.append(f"expanded {scan.bytes_declared} bytes")
+            return lines
+        matches = [
+            match
+            for match in self.results
+            if (match.archive, match.member, match.nested_path)
+            == (row.archive, row.member, row.nested_path)
+        ]
+        path = Path(row.member)
+        return [
+            f"archive  {row.archive}",
+            f"member   {' ! '.join((*row.nested_path, row.member))}",
+            f"type     {path.suffix.lower() or 'unknown'}",
+            "size     unavailable",
+            f"results  {len(matches)}",
+            f"lines    {len({match.line for match in matches})}",
+        ]
 
     def _draw_overlay(self, screen: curses.window, height: int, width: int) -> None:
         left, top, box_width, box_height = 4, 3, width - 8, height - 6
@@ -480,17 +693,22 @@ class ZipSearchTui:
                     screen, top + 1 + index, left + 2, line[: box_width - 4], curses.A_REVERSE
                 )
         elif self.overlay == "detail":
-            match = self.selected_match()
+            row = self.selected_row()
+            match = row.match if row else None
             lines = (
-                ["No match selected."]
-                if not match
-                else [
+                ["No selection."]
+                if row is None
+                else (
+                    [
                     f"archive: {match.archive}",
                     f"member: {' ! '.join((*match.nested_path, match.member))}",
                     f"line: {match.line}  type: {match.match_type}  score: {match.score}",
                     "",
                     match.text,
                 ]
+                    if match
+                    else self._node_detail_lines(row)
+                )
             )
             for index, line in enumerate(lines[: box_height - 2]):
                 self._safe_add(
@@ -501,6 +719,7 @@ class ZipSearchTui:
                 "/  edit query",
                 "Enter  run query / inspect selection",
                 "j/k, arrows, PgUp/PgDn, Home/End  navigate",
+                "Space toggle tree · Left collapse · Right expand",
                 "r root · m search mode · c toggle case",
                 "f filters · x errors · e export",
                 "Ctrl-C cancel active scan · q quit",
@@ -514,6 +733,31 @@ class ZipSearchTui:
             screen.addstr(y, x, text, attr)
         except curses.error:
             pass
+
+    @staticmethod
+    def _cell_width(text: str) -> int:
+        return sum(
+            0
+            if unicodedata.combining(char)
+            else 2
+            if unicodedata.east_asian_width(char) in "WF"
+            else 1
+            for char in text
+        )
+
+    def _safe_add_clipped(
+        self, screen: curses.window, y: int, x: int, text: str, attr: int, width: int
+    ) -> None:
+        """Draw only complete terminal cells inside one pane's reserved columns."""
+        used = 0
+        clipped: list[str] = []
+        for char in text:
+            cell_width = self._cell_width(char)
+            if used + cell_width > max(0, width):
+                break
+            clipped.append(char)
+            used += cell_width
+        self._safe_add(screen, y, x, "".join(clipped), attr)
 
     def handle(self, key: int | str) -> bool:
         if isinstance(key, str):
@@ -533,24 +777,31 @@ class ZipSearchTui:
             if key in (curses.KEY_BACKSPACE, 127, 8):
                 self.query = self.query[:-1]
                 return True
-            if key == curses.KEY_UP and self.history:
-                self.history_index = (
-                    len(self.history) - 1
-                    if self.history_index is None
-                    else max(0, self.history_index - 1)
-                )
+            if key == curses.KEY_UP:
+                if not self.history:
+                    return True
+                if self.history_index is None:
+                    self.history_draft = self.query
+                    self.history_index = len(self.history) - 1
+                else:
+                    self.history_index = max(0, min(self.history_index - 1, len(self.history) - 1))
                 self.query = self.history[self.history_index]
                 return True
-            if key == curses.KEY_DOWN and self.history_index is not None:
-                self.history_index += 1
-                self.query = (
-                    self.history[self.history_index]
-                    if self.history_index < len(self.history)
-                    else ""
-                )
+            if key == curses.KEY_DOWN:
+                if self.history_index is None:
+                    return True
+                if self.history_index >= len(self.history) - 1:
+                    self.history_index = None
+                    self.query = self.history_draft or ""
+                    self.history_draft = None
+                else:
+                    self.history_index += 1
+                    self.query = self.history[self.history_index]
                 return True
             if 32 <= key <= 0x10FFFF:
                 self.query += chr(key)
+                self.history_index = None
+                self.history_draft = None
                 return True
             return True
         if key in (ord("q"),):
@@ -560,8 +811,14 @@ class ZipSearchTui:
         elif key in (3,):
             self.cancel()
         elif key in (10, 13, curses.KEY_ENTER):
-            self.overlay = "detail" if self.selected_match() else None
+            self.overlay = "detail" if self.selected_row() else None
             self.editing = not bool(self.overlay)
+        elif key == ord(" "):
+            self._toggle_tree()
+        elif key == curses.KEY_LEFT:
+            self._toggle_tree(expand=False)
+        elif key == curses.KEY_RIGHT:
+            self._toggle_tree(expand=True)
         elif key == ord("r"):
             self.root_buffer = str(self.root)
             self.overlay = "root"

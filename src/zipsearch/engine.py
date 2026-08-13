@@ -19,7 +19,7 @@ from typing import BinaryIO
 from .models import ArchiveScan, Issue, Match, SafetyLimits, SearchOptions
 from .smart import SmartPattern
 from .smart import compile_patterns as compile_smart_patterns
-from .smart import score as smart_score
+from .smart import match as smart_match
 
 TEXT_EXTENSIONS = frozenset(
     {
@@ -233,7 +233,7 @@ def _match_text(
             except StopIteration:
                 return
         matched = tuple(source for source, regex in compiled if regex.search(text))
-        smart = smart_score(text, smart_patterns) if smart_patterns else None
+        smart = smart_match(text, smart_patterns) if smart_patterns else None
         if matched or smart:
             after: list[str] = []
             for _ in range(context):
@@ -243,17 +243,28 @@ def _match_text(
                     break
                 after.append(following[1])
                 buffered.append(following)
+            text_spans = (
+                smart.text_spans
+                if smart
+                else tuple(
+                    (found.start(), found.end())
+                    for _, expression in compiled
+                    for found in expression.finditer(text)
+                )
+            )
             yield Match(
                 archive,
                 member,
                 line_number,
                 text,
-                smart[2] if smart else matched,
+                smart.patterns if smart else matched,
                 tuple(before),
                 tuple(after),
                 nested_path,
-                smart[0] if smart else 0,
-                smart[1] if smart else ("regex" if regex else "literal"),
+                smart.score if smart else 0,
+                smart.match_type if smart else ("regex" if regex else "literal"),
+                text_spans,
+                smart.query_spans if smart else tuple((0, len(source)) for source in matched),
             )
             budget -= 1
             if budget <= 0:
