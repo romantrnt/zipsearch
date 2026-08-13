@@ -293,13 +293,20 @@ def _sqlite_lines(stream: BinaryIO) -> Iterator[tuple[int, str]]:
                     )
 
 
+def _zipfile_source(stream: BinaryIO) -> BinaryIO:
+    """Provide ``seekable()`` for Python 3.10's ``SpooledTemporaryFile``."""
+    if not hasattr(stream, "seekable"):
+        stream.seekable = lambda: True
+    return stream
+
+
 def _xlsx_lines(stream: BinaryIO) -> Iterator[tuple[int, str]]:
     """Read XLSX XML directly from a spooled temporary file; no archive tree is extracted."""
     with tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b") as spool:
         while chunk := stream.read(64 * 1024):
             spool.write(chunk)
         spool.seek(0)
-        with zipfile.ZipFile(spool) as workbook:
+        with zipfile.ZipFile(_zipfile_source(spool)) as workbook:
             shared: list[str] = []
             try:
                 with workbook.open("xl/sharedStrings.xml") as strings:
@@ -402,7 +409,7 @@ def _scan_zip(
                                 spool.seek(0)
                                 child = _scan_zip(
                                     archive_label,
-                                    spool,
+                                    _zipfile_source(spool),
                                     options,
                                     depth + 1,
                                     nested_path + (info.filename,),
