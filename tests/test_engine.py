@@ -5,7 +5,7 @@ import sqlite3
 import zipfile
 from pathlib import Path
 
-from zipsearch.engine import discover_archives, scan_archive, scan_archives
+from zipsearch.engine import _copy_member_bounded, discover_archives, scan_archive, scan_archives
 from zipsearch.models import SafetyLimits, SearchOptions
 
 
@@ -130,6 +130,23 @@ def test_sqlite_member_is_searched_and_temp_data_is_cleaned(tmp_path: Path) -> N
     assert not list(tmp_path.glob("zipsearch-*"))
 
 
+def test_sqlite_record_lines_remain_unique_across_tables(tmp_path: Path) -> None:
+    database = tmp_path / "source.sqlite"
+    connection = sqlite3.connect(database)
+    connection.execute("CREATE TABLE first_table (value TEXT)")
+    connection.execute("CREATE TABLE second_table (value TEXT)")
+    connection.execute("INSERT INTO first_table VALUES ('first needle')")
+    connection.execute("INSERT INTO second_table VALUES ('second needle')")
+    connection.commit()
+    connection.close()
+    archive = tmp_path / "database.zip"
+    write_zip(archive, {"data.sqlite": database.read_bytes()})
+    scan = scan_archive(archive, options("needle"))
+    assert [match.line for match in scan.matches] == [1, 2]
+    assert "[first_table]" in scan.matches[0].text
+    assert "[second_table]" in scan.matches[1].text
+
+
 def test_xlsx_member_is_searched(tmp_path: Path) -> None:
     workbook = tmp_path / "book.xlsx"
     with zipfile.ZipFile(workbook, "w") as archive:
@@ -143,6 +160,61 @@ def test_xlsx_member_is_searched(tmp_path: Path) -> None:
     write_zip(archive, {"book.xlsx": workbook.read_bytes()})
     scan = scan_archive(archive, options("needle"))
     assert [match.text for match in scan.matches] == ["needle value"]
+    assert dict(scan.matches[0].provenance) == {"format": "XLSX", "record": "1", "row": "1"}
+
+
+def test_stdlib_office_xml_members_are_searched_with_format_provenance(tmp_path: Path) -> None:
+    documents: dict[str, dict[str, str]] = {
+        "letter.docx": {
+            "word/document.xml": (
+                "<w:document xmlns:w='w'><w:body><w:p><w:r><w:t>docx needle</w:t>"
+                "</w:r></w:p></w:body></w:document>"
+            )
+        },
+        "slides.pptx": {
+            "ppt/slides/slide1.xml": "<p:sld xmlns:p='p' xmlns:a='a'><a:t>pptx needle</a:t></p:sld>"
+        },
+        "text.odt": {
+            "content.xml": (
+                "<office:document-content xmlns:office='office' xmlns:text='text'>"
+                "<text:p>odt needle</text:p></office:document-content>"
+            )
+        },
+    }
+    outer = tmp_path / "office.zip"
+    with zipfile.ZipFile(outer, "w") as archive:
+        for name, parts in documents.items():
+            document = io.BytesIO()
+            with zipfile.ZipFile(document, "w") as nested:
+                for part, value in parts.items():
+                    nested.writestr(part, value)
+            archive.writestr(name, document.getvalue())
+    matches = scan_archive(outer, options("needle")).matches
+    assert {match.member for match in matches} == set(documents)
+    assert {dict(match.provenance)["format"] for match in matches} == {"DOCX", "PPTX", "ODT"}
+
+
+def test_structured_record_provenance_for_csv_json_and_sqlite(tmp_path: Path) -> None:
+    database = tmp_path / "source.sqlite"
+    connection = sqlite3.connect(database)
+    connection.execute("CREATE TABLE people (name TEXT)")
+    connection.execute("INSERT INTO people VALUES ('sqlite needle')")
+    connection.commit()
+    connection.close()
+    archive = tmp_path / "structured.zip"
+    write_zip(
+        archive,
+        {
+            "people.csv": "name,email\nneedle,person@example.invalid\n",
+            "events.jsonl": '{"name":"json needle","id":7}\n',
+            "people.sqlite": database.read_bytes(),
+        },
+    )
+    matches = scan_archive(archive, options("needle")).matches
+    by_member = {match.member: dict(match.provenance) for match in matches}
+    assert by_member["people.csv"]["fields"] == "name"
+    assert by_member["events.jsonl"]["keys"] == "name, id"
+    assert by_member["people.sqlite"]["table"] == "people"
 
 
 def test_compression_ratio_and_match_limit(tmp_path: Path) -> None:
@@ -222,3 +294,14 @@ def test_literal_search_remains_contiguous_and_order_sensitive(tmp_path: Path) -
     write_zip(archive, {"people.txt": "Скрепкин Глеб\nГлеб Скрепкин\n"})
     literal = scan_archive(archive, options("Глеб Скрепкин"))
     assert [match.text for match in literal.matches] == ["Глеб Скрепкин"]
+
+
+def test_temporary_member_copy_has_an_actual_byte_bound() -> None:
+    destination = io.BytesIO()
+    try:
+        _copy_member_bounded(io.BytesIO(b"x" * 17), destination, 16)
+    except ValueError as exc:
+        assert "safety limit" in str(exc)
+    else:
+        raise AssertionError("oversized expanded input was accepted")
+    assert len(destination.getvalue()) <= 16

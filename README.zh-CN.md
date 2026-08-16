@@ -14,7 +14,25 @@ ZipSearch 是本地终端工具，用于检索 ZIP 文件中保存的异构数�
 
 键盘优先的 TUI 在一个视图中呈现归档、成员、结果和记录详情，便于快速检查。
 
-ZipSearch 可以看作 `awerpars` 的精神续作：那个更早的项目所积累的一些思路和经验，后来演化为这个独立实现。
+## 四项法则
+
+这是 ZipSearch 的核心工程规则。
+
+### 1. 归档是事实来源
+
+原始归档集合始终具有权威性。索引、元数据、分组和缓存只用于加速访问；它们不会替代或重新定义原始数据。
+
+### 2. 索引是优化，而不是准入条件
+
+索引是可选的加速手段。搜索正确性绝不依赖它：索引缺失、过期、损坏或不可用时，ZipSearch 会安全地回退到扫描源归档。
+
+### 3. Python 已足够
+
+ZipSearch 有意不使用运行时第三方依赖或外部服务。依靠 Python 标准库，它保持可移植、离线可用且易于理解。
+
+### 4. 在数据存放处搜索
+
+ZipSearch 直接处理归档成员，不要求完整解压语料库，也不要求长期保留复制出的工作树。
 
 ## 为什么需要它
 
@@ -27,7 +45,8 @@ ZipSearch 可以看作 `awerpars` 的精神续作：那个更早的项目所积�
 | 方面 | ZipSearch 提供的能力 |
 | --- | --- |
 | 搜索 | LITERAL、正则表达式与归一化、按 token 感知的 SMART 搜索 |
-| 数据 | 文本类成员、SQLite 行、XLSX 工作表行、嵌套 ZIP |
+| 实体 | 确定性的电话、邮箱/域名、URL、IP 地址、UUID 和哈希；可在 TUI 中跳转到相关出现位置 |
+| 数据 | 文本类成员、SQLite/XLSX 行、DOCX/PPTX/ODT 文本、嵌套 ZIP |
 | 检查 | 归档 → 成员 → 结果树、DETAIL 面板、中央目录检查 |
 | 操作 | include/exclude glob、扩展名过滤、上下文、切换根目录、导出、取消 |
 | 控制 | 成员数、大小、展开后总大小、压缩比、嵌套深度限制；可恢复问题报告 |
@@ -48,6 +67,15 @@ python -m pip install -e . pytest ruff
 ```
 
 不带参数运行 `zipsearch` 时，只有标准输入和输出均为终端才会打开 TUI。在脚本中请显式使用子命令。
+
+可从源码检出目录构建离线单文件 Python 应用：
+
+```console
+python tools/build_zipapp.py zipsearch.pyz
+python zipsearch.pyz search ./archives needle
+```
+
+该 zipapp 只打包 ZipSearch；运行时仍需要 Python 3.10+。
 
 ## 快速开始
 
@@ -74,6 +102,36 @@ zipsearch inspect evidence.zip --json
 
 完整 CLI 参数请运行 `zipsearch search --help`。
 
+## 可选本地索引
+
+始终可以直接扫描；对全新语料库这仍是默认行为。索引是可删除的 SQLite 候选映射，而不是
+导入档案内容：它只保存规范化词项、电话号码 postings 和紧凑的 archive-local unit/line 定位信息，
+不保存记录文本。posting 段采用带 checksum 的 versioned delta-varint 封装；singleton 值会内联，
+直到在另一档案中出现。输出前，候选记录会从原始 ZIP 重新读取，并由同一套 LITERAL 或 SMART 匹配器验证。
+验证器只打开已索引的档案和选中的成员路径；不会虚称 deflated 成员可随机访问，恢复记录时
+该成员仍必须解压。
+
+```console
+zipsearch index build ./archives
+zipsearch index status ./archives
+zipsearch search ./archives needle --no-index
+zipsearch search ./archives 'Глеб Скрепкин +79087562342' --smart --explain
+zipsearch index update ./archives
+zipsearch index verify ./archives
+zipsearch index clean ./archives
+```
+
+默认索引为语料库目录旁的 `.zipsearch.sqlite`（单个档案则位于其旁）。通过 `--index-path PATH`
+指定其它位置，也适用于只读语料库。缺失、架构不兼容或损坏的索引绝不会被信任；搜索会退回直接扫描。
+对于过期或 BUILDING 索引，已验证的干净档案覆盖会与新增/变更档案的直接扫描组合（`HYBRID`）；
+不完整的生成状态绝不会隐藏源数据结果。`index update` 可在 archive transaction 边界恢复。Fingerprint 使用
+stat 与 ZIP 中央目录元数据，避免对完整 archive payload 进行批量哈希。
+
+即使索引 READY，可解释的 planner 仍可能选择直接扫描。它使用候选档案/成员覆盖率而非不透明
+score：选择性词项和规范化电话使用 `INDEX`；会重开几乎所有成员的宽泛 SMART 使用 `SCAN`；
+混合新鲜度使用 `HYBRID`。
+`--explain` 会显示原因以及候选/总档案和成员数量。
+
 ## 搜索语义
 
 | 模式 | 命中规则 | 排序 |
@@ -93,6 +151,12 @@ SMART 采用 NFKC 归一化；在忽略大小写时会折叠大小写，并将�
 例如，`Глеб Скрепкин +79087562342` 可以命中 `Игорь Скрепкин; +7 (908) 756-23-42`。其中的命中证据是 `Скрепкин` 和电话号码；`Глеб` 仍显示在查询中，但不被当作证据。
 
 `match_type` 和 `score` 会出现在 JSONL 输出及结果详情中。score 仅是内部排序信号，不是百分比，也不能跨查询比较相关性。
+
+### 高级查询与分组
+
+`--advanced` 接受一个布尔查询，支持引号、`AND`/`OR`/`NOT`、括号、前缀及 `archive:`、`member:`、`format:`、`table:`、`sheet:`、`fields:`、`phone:`、`email:` 选择器。它始终在源数据上验证，并刻意采用直接扫描：复杂布尔逻辑和记录元数据不会由候选索引近似。
+
+默认输出原始出现位置。`--group-by exact|phone|email|entity` 仅改变展示：人类输出仍打印每个出现位置；JSONL 输出稳定的 `group` 对象，其中含有完整 raw match 对象及 archive、member、locator、provenance 和 execution path。
 
 ## TUI
 
@@ -122,7 +186,7 @@ SMART 采用 NFKC 归一化；在忽略大小写时会折叠大小写，并将�
 | <kbd>Ctrl-C</kbd> | 取消活动搜索 |
 | <kbd>?</kbd> / <kbd>q</kbd> | 帮助 / 退出 |
 
-TUI 中以逗号分隔的查询组件会成为独立 pattern。切换根目录会保留查询和设置，但清除过期结果。查询历史在会话中累积；浏览到最新条目之后会恢复当前正在编辑的草稿。
+TUI 中以逗号分隔的查询组件会成为独立 pattern。切换根目录会保留查询和设置，但清除过期结果。查询历史在会话中累积；浏览到最新条目之后会恢复当前正在编辑的草稿。除非使用 `--no-state`，历史和最近根目录会保存在小型、受限的本地 JSON 文件中；损坏、缺失、只读或不可用的状态会被忽略，绝不会影响搜索，也不会复制语料记录。
 
 ## 数据与归档支持
 
@@ -152,6 +216,9 @@ CLI 中嵌套 ZIP 路径用 `!` 表示，例如 `outer.zip:inner.zip!records.txt
 | `--exclude GLOB` | — | 跳过匹配的成员路径或 basename；可重复 |
 | `--extension EXT` | — | 仅扫描选定扩展名；可重复 |
 | `--no-recursive` | off | 不进入输入目录的下级目录 |
+| `--no-index` | off | 即使索引 READY 也强制直接流式扫描 |
+| `--index-path PATH` | — | 从此位置读取可删除索引 |
+| `--explain` | off | 在 stderr 报告 INDEX/SCAN 选择与候选计划 |
 | `--jsonl` | off | 以 JSON Lines 写出匹配对象和最终摘要 |
 | `-q`, `--quiet` | off | 不输出人工摘要和警告 |
 
@@ -174,7 +241,7 @@ TUI 也提供等价设置：扩展名、include/exclude glob、编码、上下�
 
 ## 存储行为
 
-ZipSearch 从不调用 `extractall`。普通文本成员直接从归档打开并增量读取。SQLite 需要随机访问，因此仅该成员会复制到自动删除的临时目录并以只读方式打开。XLSX 和嵌套 ZIP 使用 spooled 临时文件：前 8 MiB 保留在内存中，之后使用系统临时区域。`inspect` 显示的归档元数据来自中央目录，不会解压成员。
+ZipSearch 从不调用 `extractall`。普通文本成员直接从归档打开并增量读取。SQLite 需要随机访问，因此仅该成员会复制到自动删除的临时目录并以只读方式打开。XLSX、Office 文档和嵌套 ZIP 使用 spooled 临时文件：前 8 MiB 保留在内存中，之后使用系统临时区域。每次复制都会再次受成员上限约束；嵌入的 XLSX 会独立检查成员数量、大小和压缩比。`inspect` 显示的归档元数据来自中央目录，不会解压成员。
 
 ## 工作方式
 
@@ -195,6 +262,16 @@ ZipSearch 从不调用 `extractall`。普通文本成员直接从归档打开并
 python benchmarks/benchmark.py
 ```
 
+它报告冷直接扫描、首次索引构建、热索引查询、索引字节数和结果一致性。任意 REGEX 仍使用
+直接扫描：倒排索引通常无法保持 Python 正则表达式的语义。
+
+`python benchmarks/index_benchmark.py` 还会生成罕见、中等、常见、电话号码以及多组件 SMART
+负载。它分别报告候选 lookup 与验证、打开的档案、解压成员、验证 declared bytes、大小比例及 parity。
+
+`python benchmarks/index_scaling.py` 测量 12、36 与 72 个档案的确定性语料库，包括 unchanged
+update 成本。它刻意同时报告 compressed 与 expanded source 比例：SQLite metadata 在小型高度重复
+集合上有明显 fixed 和 posting overhead。
+
 如需通过公开 CLI 运行生成的功能数据集：
 
 ```console
@@ -213,9 +290,14 @@ python benchmarks/validate_realistic_dataset.py
 - 仅支持 ZIP 容器。
 - 加密 ZIP 成员会被跳过；未实现密码输入。
 - XLSX 处理读取工作表值，不会像电子表格应用一样处理格式或公式。
-- SQLite 和 XLSX 处理会按上述说明创建临时数据。
+- SQLite 和 XLSX 处理会按上述说明创建临时数据。可选索引不是完整文本副本，可用
+  `zipsearch index clean` 删除。
 - 文本自动检测仅限 UTF-8 后备 CP1251；其他已知编码请使用 `--encoding`。
 - 安全检查可降低恶意归档的风险，但不能代替对不可信输入进行操作系统级隔离。
+
+## 历史
+
+ZipSearch 是 `awerpars` 的精神续作；后者是早期的归档搜索实验。其有价值的思想在这里演化为更结构化的工程工具，具有源归档验证、受限处理和刻意保持可选的索引。
 
 ## 开发
 
@@ -226,7 +308,7 @@ ruff check .
 python -m build
 ```
 
-持续集成在 Python 3.10、3.11 和 3.12 上运行测试与 Ruff。贡献说明见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+提交更改前请运行测试和 Ruff。贡献说明见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 仓库结构
 

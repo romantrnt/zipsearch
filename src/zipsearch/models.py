@@ -21,6 +21,7 @@ class SearchOptions:
     patterns: tuple[str, ...]
     regex: bool = False
     smart: bool = False
+    advanced_query: str | None = None
     case_sensitive: bool = False
     include: tuple[str, ...] = ()
     exclude: tuple[str, ...] = ()
@@ -49,6 +50,8 @@ class Match:
     # matched source pattern.
     text_spans: tuple[tuple[int, int], ...] = ()
     query_spans: tuple[tuple[int, int], ...] = ()
+    execution_path: str = "scan"
+    provenance: tuple[tuple[str, str], ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -83,6 +86,7 @@ class Summary:
     members_scanned: int = 0
     matches: int = 0
     issues: int = 0
+    execution_path: str = "scan"
 
-    def as_dict(self) -> dict[str, int]:
+    def as_dict(self) -> dict[str, int | str]:
         return asdict(self)

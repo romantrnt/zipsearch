@@ -80,9 +80,7 @@ def _merge_spans(spans: list[tuple[int, int]]) -> tuple[tuple[int, int], ...]:
 def _components(value: str) -> tuple[tuple[str, int, int, bool], ...]:
     """Return word components plus phone-shaped components, preserving source offsets."""
     phones = [
-        match
-        for match in _PHONE_COMPONENT.finditer(value)
-        if len(phone_digits(match.group())) >= 7
+        match for match in _PHONE_COMPONENT.finditer(value) if len(phone_digits(match.group())) >= 7
     ]
     result = [(match.group(), match.start(), match.end(), True) for match in phones]
     result.extend(
@@ -152,7 +150,8 @@ def match(text: str, patterns: tuple[SmartPattern, ...]) -> SmartMatch | None:
                 for component in word_components
             }
         query_spans = [
-            (start, end) for value_, start, end, is_phone in components
+            (start, end)
+            for value_, start, end, is_phone in components
             if (is_phone and type_ == "phone")
             or (
                 not is_phone
@@ -160,7 +159,9 @@ def match(text: str, patterns: tuple[SmartPattern, ...]) -> SmartMatch | None:
             )
         ]
         text_spans = _word_spans(
-            text, matched_words, case_sensitive=pattern.case_sensitive,
+            text,
+            matched_words,
+            case_sensitive=pattern.case_sensitive,
             prefixes=True,
         )
         if type_ == "phone":
@@ -175,7 +176,8 @@ def match(text: str, patterns: tuple[SmartPattern, ...]) -> SmartMatch | None:
             start = comparable.find(pattern.phone)
             text_spans += (
                 [(digits[start][0], digits[start + len(pattern.phone) - 1][0] + 1)]
-                if start >= 0 else []
+                if start >= 0
+                else []
             )
         candidate = SmartMatch(
             value, type_, (pattern.source,), _merge_spans(text_spans), _merge_spans(query_spans)

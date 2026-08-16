@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fnmatch
 import io
+import json
 import logging
 import os
 import re
@@ -17,6 +18,9 @@ from threading import Event
 from typing import BinaryIO
 
 from .models import ArchiveScan, Issue, Match, SafetyLimits, SearchOptions
+from .query import evaluate as evaluate_advanced
+from .query import parse as parse_advanced_query
+from .query import positive_terms
 from .smart import SmartPattern
 from .smart import compile_patterns as compile_smart_patterns
 from .smart import match as smart_match
@@ -46,6 +50,7 @@ TEXT_EXTENSIONS = frozenset(
 )
 SQLITE_EXTENSIONS = frozenset({".db", ".sqlite", ".sqlite3"})
 XLSX_EXTENSIONS = frozenset({".xlsx"})
+OFFICE_EXTENSIONS = frozenset({".docx", ".pptx", ".odt"})
 LOGGER = logging.getLogger(__name__)
 
 
@@ -86,7 +91,9 @@ def _path_allowed(name: str, options: SearchOptions) -> bool:
         }
         if suffix not in accepted:
             return False
-    elif suffix not in TEXT_EXTENSIONS | SQLITE_EXTENSIONS | XLSX_EXTENSIONS | {".zip"}:
+    elif suffix not in (
+        TEXT_EXTENSIONS | SQLITE_EXTENSIONS | XLSX_EXTENSIONS | OFFICE_EXTENSIONS | {".zip"}
+    ):
         return False
     if options.include and not any(
         fnmatch.fnmatchcase(normalized, pattern) or fnmatch.fnmatchcase(basename, pattern)
@@ -207,6 +214,23 @@ def _text_lines(stream: BinaryIO, encoding: str) -> Iterator[tuple[int, str]]:
             yield line_number, line.rstrip("\r\n")
 
 
+def _copy_member_bounded(
+    source: BinaryIO,
+    target: BinaryIO,
+    maximum: int,
+    cancelled: Event | None = None,
+) -> None:
+    """Copy one expanded member without trusting its declared ZIP size."""
+    copied = 0
+    while chunk := source.read(64 * 1024):
+        if cancelled is not None and cancelled.is_set():
+            raise InterruptedError("search cancelled")
+        copied += len(chunk)
+        if copied > maximum:
+            raise ValueError("expanded member exceeds safety limit while reading")
+        target.write(chunk)
+
+
 def _match_text(
     archive: str,
     member: str,
@@ -218,10 +242,12 @@ def _match_text(
     cancelled: Event | None = None,
     smart_patterns: tuple[SmartPattern, ...] = (),
     regex: bool = False,
+    advanced_node: object | None = None,
 ) -> Iterator[Match]:
     before: deque[str] = deque(maxlen=context)
     iterator = iter(lines)
     buffered: deque[tuple[int, str]] = deque()
+    header: str | None = None
     while True:
         if cancelled is not None and cancelled.is_set():
             return
@@ -234,7 +260,17 @@ def _match_text(
                 return
         matched = tuple(source for source, regex in compiled if regex.search(text))
         smart = smart_match(text, smart_patterns) if smart_patterns else None
-        if matched or smart:
+        advanced_patterns = positive_terms(advanced_node) if advanced_node is not None else ()
+        evidence_patterns = smart.patterns if smart else matched or advanced_patterns
+        provenance = _structured_provenance(member, line_number, text, header, evidence_patterns)
+        advanced = advanced_node is not None and evaluate_advanced(
+            advanced_node,
+            text=text,
+            archive=archive,
+            member=member,
+            provenance=dict(provenance),
+        )
+        if matched or smart or advanced:
             after: list[str] = []
             for _ in range(context):
                 try:
@@ -257,37 +293,88 @@ def _match_text(
                 member,
                 line_number,
                 text,
-                smart.patterns if smart else matched,
+                evidence_patterns,
                 tuple(before),
                 tuple(after),
                 nested_path,
                 smart.score if smart else 0,
-                smart.match_type if smart else ("regex" if regex else "literal"),
+                smart.match_type
+                if smart
+                else ("advanced" if advanced else "regex" if regex else "literal"),
                 text_spans,
-                smart.query_spans if smart else tuple((0, len(source)) for source in matched),
+                smart.query_spans
+                if smart
+                else tuple((0, len(source)) for source in matched or advanced_patterns),
+                "scan",
+                provenance,
             )
             budget -= 1
             if budget <= 0:
                 return
         before.append(text)
+        if line_number == 1:
+            header = text
 
 
-def _sqlite_lines(stream: BinaryIO) -> Iterator[tuple[int, str]]:
+def _structured_provenance(
+    member: str, line: int, text: str, header: str | None, patterns: tuple[str, ...]
+) -> tuple[tuple[str, str], ...]:
+    """Small deterministic context from formats already rendered as text records."""
+    suffix = PurePosixPath(member).suffix.lower()
+    details: list[tuple[str, str]] = [("record", str(line))]
+    if suffix in {".csv", ".tsv"}:
+        delimiter = "\t" if suffix == ".tsv" else ","
+        details.insert(0, ("format", "TSV" if suffix == ".tsv" else "CSV"))
+        if header and line > 1:
+            columns = header.split(delimiter)
+            values = text.split(delimiter)
+            selected = [
+                column
+                for column, value in zip(columns, values, strict=False)
+                if not patterns
+                or any(pattern.casefold() in value.casefold() for pattern in patterns)
+            ]
+            if selected:
+                details.append(("fields", ", ".join(selected)))
+    elif suffix in {".json", ".jsonl"}:
+        details.insert(0, ("format", "JSONL" if suffix == ".jsonl" else "JSON"))
+        try:
+            value = json.loads(text)
+            if isinstance(value, dict):
+                details.append(("keys", ", ".join(str(key) for key in value)))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+    elif suffix in SQLITE_EXTENSIONS:
+        table = re.match(r"\[([^]]+)]", text)
+        details.insert(0, ("format", "SQLite"))
+        if table:
+            details.append(("table", table.group(1)))
+    elif suffix in XLSX_EXTENSIONS:
+        details.insert(0, ("format", "XLSX"))
+        details.append(("row", str(line)))
+    elif suffix in OFFICE_EXTENSIONS:
+        details.insert(0, ("format", suffix[1:].upper()))
+        details.append(("record", str(line)))
+    return tuple(details)
+
+
+def _sqlite_lines(
+    stream: BinaryIO, maximum: int, cancelled: Event | None = None
+) -> Iterator[tuple[int, str]]:
     """SQLite requires random access, so copy just this member into an auto-cleaned file."""
     with tempfile.TemporaryDirectory(prefix="zipsearch-") as temp_dir:
         database = Path(temp_dir) / "member.sqlite"
         with database.open("wb") as output:
-            while chunk := stream.read(64 * 1024):
-                output.write(chunk)
+            _copy_member_bounded(stream, output, maximum, cancelled)
         with closing(sqlite3.connect(f"file:{database}?mode=ro", uri=True)) as connection:
             tables = connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            line_number = 0
             for (table,) in tables:
                 quoted = '"' + table.replace('"', '""') + '"'
-                for row_number, row in enumerate(
-                    connection.execute(f"SELECT * FROM {quoted}"), start=1
-                ):
+                for row in connection.execute(f"SELECT * FROM {quoted}"):
+                    line_number += 1
                     yield (
-                        row_number,
+                        line_number,
                         f"[{table}] "
                         + " ".join("" if value is None else str(value) for value in row),
                     )
@@ -300,13 +387,32 @@ def _zipfile_source(stream: BinaryIO) -> BinaryIO:
     return stream
 
 
-def _xlsx_lines(stream: BinaryIO) -> Iterator[tuple[int, str]]:
+def _xlsx_lines(
+    stream: BinaryIO, maximum: int, cancelled: Event | None = None
+) -> Iterator[tuple[int, str]]:
     """Read XLSX XML directly from a spooled temporary file; no archive tree is extracted."""
     with tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b") as spool:
-        while chunk := stream.read(64 * 1024):
-            spool.write(chunk)
+        _copy_member_bounded(stream, spool, maximum, cancelled)
         spool.seek(0)
         with zipfile.ZipFile(_zipfile_source(spool)) as workbook:
+            # An XLSX is itself a ZIP. Apply the same declared-size and ratio
+            # guard before parsing its XML, rather than trusting its outer ZIP.
+            permitted, issues = _validate_infos(
+                workbook.infolist(),
+                "embedded XLSX",
+                SearchOptions(
+                    patterns=("_",),
+                    limits=SafetyLimits(
+                        max_members=10_000,
+                        max_member_bytes=maximum,
+                        max_total_bytes=maximum,
+                        max_compression_ratio=200.0,
+                        max_nested_depth=0,
+                    ),
+                ),
+            )
+            if issues or not permitted:
+                raise ValueError("XLSX contents exceed parser safety limits")
             shared: list[str] = []
             try:
                 with workbook.open("xl/sharedStrings.xml") as strings:
@@ -353,6 +459,47 @@ def _xlsx_lines(stream: BinaryIO) -> Iterator[tuple[int, str]]:
                         row.clear()
 
 
+def _office_lines(
+    stream: BinaryIO, suffix: str, maximum: int, cancelled: Event | None = None
+) -> Iterator[tuple[int, str]]:
+    """Extract useful primary text from dependency-free ZIP/XML office documents."""
+    import xml.etree.ElementTree as element_tree
+
+    targets = {
+        ".docx": lambda name: (
+            name == "word/document.xml"
+            or name.startswith("word/header")
+            or name.startswith("word/footer")
+        ),
+        ".pptx": lambda name: (
+            name.startswith("ppt/slides/slide") or name.startswith("ppt/notesSlides/notesSlide")
+        ),
+        ".odt": lambda name: name == "content.xml",
+    }
+    paragraph_tags = {".docx": ("}p",), ".pptx": ("}t",), ".odt": ("}p", "}h")}
+    with tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b") as spool:
+        _copy_member_bounded(stream, spool, maximum, cancelled)
+        spool.seek(0)
+        with zipfile.ZipFile(_zipfile_source(spool)) as document:
+            infos = [info for info in document.infolist() if targets[suffix](info.filename)]
+            if len(infos) > 512 or sum(info.file_size for info in infos) > 128 * 1024 * 1024:
+                raise ValueError("office document XML exceeds parser safety limit")
+            line = 0
+            for info in infos:
+                if info.file_size > 32 * 1024 * 1024:
+                    raise ValueError("office document XML exceeds parser safety limit")
+                if info.file_size / max(info.compress_size, 1) > 200:
+                    raise ValueError("office document XML exceeds parser safety limit")
+                with document.open(info) as source:
+                    for _, element in element_tree.iterparse(source, events=("end",)):
+                        if element.tag.endswith(paragraph_tags[suffix]):
+                            value = "".join(element.itertext()).strip()
+                            if value:
+                                line += 1
+                                yield line, value
+                            element.clear()
+
+
 def _scan_zip(
     archive_label: str,
     source: str | Path | BinaryIO,
@@ -362,10 +509,11 @@ def _scan_zip(
     cancelled: Event | None = None,
 ) -> ArchiveScan:
     scan = ArchiveScan(Path(archive_label))
-    compiled = [] if options.smart else _compile_patterns(options)
+    advanced_node = parse_advanced_query(options.advanced_query) if options.advanced_query else None
+    compiled = [] if options.smart or advanced_node is not None else _compile_patterns(options)
     smart_patterns = (
         compile_smart_patterns(options.patterns, case_sensitive=options.case_sensitive)
-        if options.smart
+        if options.smart and advanced_node is None
         else ()
     )
     try:
@@ -404,8 +552,9 @@ def _scan_zip(
                             with tempfile.SpooledTemporaryFile(
                                 max_size=8 * 1024 * 1024, mode="w+b"
                             ) as spool:
-                                while chunk := member.read(64 * 1024):
-                                    spool.write(chunk)
+                                _copy_member_bounded(
+                                    member, spool, options.limits.max_member_bytes, cancelled
+                                )
                                 spool.seek(0)
                                 child = _scan_zip(
                                     archive_label,
@@ -420,9 +569,15 @@ def _scan_zip(
                             scan.issues.extend(child.issues)
                             continue
                         if suffix in SQLITE_EXTENSIONS:
-                            lines = _sqlite_lines(member)
+                            lines = _sqlite_lines(
+                                member, options.limits.max_member_bytes, cancelled
+                            )
                         elif suffix in XLSX_EXTENSIONS:
-                            lines = _xlsx_lines(member)
+                            lines = _xlsx_lines(member, options.limits.max_member_bytes, cancelled)
+                        elif suffix in OFFICE_EXTENSIONS:
+                            lines = _office_lines(
+                                member, suffix, options.limits.max_member_bytes, cancelled
+                            )
                         else:
                             lines = _text_lines(member, options.encoding)
                         matches = _match_text(
@@ -438,6 +593,7 @@ def _scan_zip(
                             cancelled,
                             smart_patterns,
                             options.regex,
+                            advanced_node,
                         )
                         _append_matches(scan.matches, matches, options)
                         scan.members_scanned += 1
@@ -489,6 +645,133 @@ def _append_matches(target: list[Match], matches: Iterator[Match], options: Sear
 def scan_archive(path: Path, options: SearchOptions, cancelled: Event | None = None) -> ArchiveScan:
     LOGGER.debug("scanning archive %s", path)
     return _scan_zip(str(path), path, options, cancelled=cancelled)
+
+
+def scan_member_locator(
+    path: Path,
+    member_indices: tuple[int, ...],
+    options: SearchOptions,
+    cancelled: Event | None = None,
+) -> ArchiveScan:
+    """Verify one indexed member route without visiting unrelated ZIP members.
+
+    ZIP compression is sequential within a member, so a selected deflated member
+    still has to be decompressed.  The route prevents the much more expensive
+    mistake of opening every other member (or every other archive) on a warm
+    indexed search.
+    """
+    scan = ArchiveScan(path)
+    advanced_node = parse_advanced_query(options.advanced_query) if options.advanced_query else None
+    compiled = [] if options.smart or advanced_node is not None else _compile_patterns(options)
+    smart_patterns = (
+        compile_smart_patterns(options.patterns, case_sensitive=options.case_sensitive)
+        if options.smart and advanced_node is None
+        else ()
+    )
+
+    def visit(
+        source: str | Path | BinaryIO,
+        route: tuple[int, ...],
+        depth: int,
+        nested_path: tuple[str, ...],
+    ) -> None:
+        try:
+            with zipfile.ZipFile(source) as archive:
+                infos = archive.infolist()
+                scan.members_seen += len([info for info in infos if not info.is_dir()])
+                permitted, issues = _validate_infos(infos, str(path), options)
+                scan.issues.extend(issues)
+                if not route or route[0] < 0 or route[0] >= len(infos):
+                    scan.issues.append(
+                        Issue(str(path), "indexed member locator is invalid", kind="index")
+                    )
+                    return
+                info = infos[route[0]]
+                if not any(info is candidate for candidate in permitted):
+                    return
+                if cancelled is not None and cancelled.is_set():
+                    return
+                suffix = PurePosixPath(info.filename).suffix.lower()
+                # This is the selected member's declared expansion, not the
+                # whole archive's central-directory total.
+                scan.bytes_declared += info.file_size
+                if len(route) > 1:
+                    normalized = info.filename.replace("\\", "/")
+                    if suffix != ".zip" or _path_excluded(
+                        normalized, PurePosixPath(normalized).name, options
+                    ):
+                        return
+                    if depth >= options.limits.max_nested_depth:
+                        scan.issues.append(
+                            Issue(
+                                str(path),
+                                "skipped nested ZIP: depth limit reached",
+                                info.filename,
+                                "safety",
+                            )
+                        )
+                        return
+                    with archive.open(info) as member:
+                        with tempfile.SpooledTemporaryFile(
+                            max_size=8 * 1024 * 1024, mode="w+b"
+                        ) as spool:
+                            _copy_member_bounded(
+                                member, spool, options.limits.max_member_bytes, cancelled
+                            )
+                            spool.seek(0)
+                            visit(
+                                _zipfile_source(spool),
+                                route[1:],
+                                depth + 1,
+                                nested_path + (info.filename,),
+                            )
+                    return
+                if suffix == ".zip" or not _path_allowed(info.filename, options):
+                    return
+                with archive.open(info) as member:
+                    if suffix in SQLITE_EXTENSIONS:
+                        lines = _sqlite_lines(member, options.limits.max_member_bytes, cancelled)
+                    elif suffix in XLSX_EXTENSIONS:
+                        lines = _xlsx_lines(member, options.limits.max_member_bytes, cancelled)
+                    elif suffix in OFFICE_EXTENSIONS:
+                        lines = _office_lines(
+                            member, suffix, options.limits.max_member_bytes, cancelled
+                        )
+                    else:
+                        lines = _text_lines(member, options.encoding)
+                    matches = _match_text(
+                        str(path),
+                        info.filename,
+                        lines,
+                        compiled,
+                        options.max_matches,
+                        options.context,
+                        nested_path,
+                        cancelled,
+                        smart_patterns,
+                        options.regex,
+                        advanced_node,
+                    )
+                    _append_matches(scan.matches, matches, options)
+                    scan.members_scanned += 1
+        except (
+            OSError,
+            RuntimeError,
+            ValueError,
+            sqlite3.Error,
+            zipfile.BadZipFile,
+            zipfile.LargeZipFile,
+            NotImplementedError,
+        ) as exc:
+            scan.issues.append(
+                Issue(str(path), f"cannot read indexed member: {exc}", kind="archive")
+            )
+
+    visit(path, member_indices, 0, ())
+    if options.smart:
+        scan.matches.sort(key=_match_sort_key)
+        del scan.matches[options.max_matches :]
+    return scan
 
 
 def inspect_archive(path: Path, limits: SafetyLimits) -> ArchiveScan:

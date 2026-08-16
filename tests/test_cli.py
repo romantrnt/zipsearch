@@ -46,3 +46,15 @@ def test_cli_smart_is_ranked_and_literal_remains_unchanged(tmp_path: Path, capsy
     assert main(["search", str(archive), "Глеб Скрепкин", "--jsonl"]) == 0
     literal = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert [item["text"] for item in literal if item["type"] == "match"] == ["Глеб Скрепкин"]
+
+
+def test_cli_grouped_json_retains_all_raw_occurrences(tmp_path: Path, capsys) -> None:
+    archive = tmp_path / "duplicates.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        output.writestr("one.txt", "needle\n")
+        output.writestr("two.txt", "needle\n")
+    assert main(["search", str(archive), "needle", "--group-by", "exact", "--jsonl"]) == 0
+    objects = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    grouped = next(item for item in objects if item["type"] == "group")
+    assert grouped["key"] == "needle"
+    assert [item["member"] for item in grouped["occurrences"]] == ["one.txt", "two.txt"]

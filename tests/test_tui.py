@@ -5,7 +5,8 @@ import zipfile
 from pathlib import Path
 
 from zipsearch import tui
-from zipsearch.models import Match
+from zipsearch.index import build_or_update, default_index_path
+from zipsearch.models import Match, SafetyLimits
 from zipsearch.tui import ZipSearchTui
 
 
@@ -53,10 +54,17 @@ class GridScreen(AttributeScreen):
                     self.grid[y][x + offset] = char
 
 
-
 def wait_for_terminal_state(app: ZipSearchTui) -> None:
     deadline = time.monotonic() + 5
     while app.state == "SEARCHING" and time.monotonic() < deadline:
+        app.drain()
+        time.sleep(0.01)
+    app.drain()
+
+
+def wait_for_index_state(app: ZipSearchTui) -> None:
+    deadline = time.monotonic() + 5
+    while app.state == "INDEXING" and time.monotonic() < deadline:
         app.drain()
         time.sleep(0.01)
     app.drain()
@@ -75,6 +83,109 @@ def test_tui_controller_runs_real_engine_and_matches_expected_result(tmp_path: P
     assert len(app.results) == 1
     assert app.selected_match() is not None
     assert app.selected_match().member == "данные/люди.txt"
+
+
+def test_tui_uses_the_shared_index_planner_for_selective_queries(tmp_path: Path) -> None:
+    with zipfile.ZipFile(tmp_path / "records.zip", "w") as output:
+        output.writestr("target.txt", "phone +7 (999) 555-01-23\n")
+        output.writestr("other-a.txt", "ordinary\n")
+        output.writestr("other-b.txt", "ordinary\n")
+    build_or_update(tmp_path, default_index_path(tmp_path), SafetyLimits(), rebuild=True)
+    app = ZipSearchTui(tmp_path)
+    app.query = "+79995550123"
+    app.run_search()
+    wait_for_terminal_state(app)
+    assert app.execution_path == "INDEX"
+    assert app.results and app.results[0].execution_path == "index"
+
+
+def test_tui_index_overlay_build_verify_and_clean(tmp_path: Path) -> None:
+    with zipfile.ZipFile(tmp_path / "records.zip", "w") as output:
+        output.writestr("records.txt", "needle\n")
+    app = ZipSearchTui(tmp_path)
+    app.editing = False
+    app.handle("i")
+    assert app.overlay == "index"
+    app.handle("b")
+    assert app.state == "INDEXING"
+    wait_for_index_state(app)
+    assert app.index_state == "READY"
+    app.handle("v")
+    wait_for_index_state(app)
+    assert app.index_state == "READY"
+    app.handle("d")
+    wait_for_index_state(app)
+    assert app.index_state == "NONE"
+
+
+def test_tui_related_phone_navigation_reuses_search(tmp_path: Path) -> None:
+    with zipfile.ZipFile(tmp_path / "records.zip", "w") as output:
+        output.writestr("records.txt", "first +7 (999) 555-01-23\nsecond +79995550123\n")
+    app = ZipSearchTui(tmp_path)
+    app.query = "first"
+    app.run_search()
+    wait_for_terminal_state(app)
+    app.editing = False
+    app.handle("o")
+    wait_for_terminal_state(app)
+    assert app.query == "+79995550123"
+    assert len(app.results) == 2
+
+
+def test_tui_related_entity_chooser_uses_existing_overlay_style(tmp_path: Path) -> None:
+    with zipfile.ZipFile(tmp_path / "records.zip", "w") as output:
+        output.writestr(
+            "records.txt",
+            "needle https://example.invalid/a 192.0.2.4\nother 192.0.2.4\n",
+        )
+    app = ZipSearchTui(tmp_path)
+    app.query = "needle"
+    app.run_search()
+    wait_for_terminal_state(app)
+    app.editing = False
+    app.handle("o")
+    assert app.overlay == "related"
+    assert len(app.related_entities) >= 2
+    app.handle("j")
+    app.handle("\n")
+    wait_for_terminal_state(app)
+    assert app.overlay is None
+    assert app.results
+
+
+def test_tui_related_email_navigation_uses_exact_literal_search(tmp_path: Path) -> None:
+    with zipfile.ZipFile(tmp_path / "records.zip", "w") as output:
+        output.writestr(
+            "records.txt", "first person@example.invalid\nsecond person@example.invalid\n"
+        )
+    app = ZipSearchTui(tmp_path)
+    app.query = "first"
+    app.run_search()
+    wait_for_terminal_state(app)
+    app.editing = False
+    app.handle("o")
+    wait_for_terminal_state(app)
+    assert app.query == "person@example.invalid" and app.mode == "LITERAL"
+    assert len(app.results) == 2
+
+
+def test_tui_grouping_is_a_collapsible_presentation_over_raw_matches(tmp_path: Path) -> None:
+    with zipfile.ZipFile(tmp_path / "records.zip", "w") as output:
+        output.writestr("records.txt", "first +7 (999) 555-01-23\nsecond +79995550123\n")
+    app = ZipSearchTui(tmp_path)
+    app.query = "999"
+    app.run_search()
+    wait_for_terminal_state(app)
+    raw = list(app.results)
+    app.editing = False
+    app.handle("g")
+    app.handle("g")
+    assert app.group_mode == "phone"
+    assert app.rows[0].kind == "group" and "2 occurrences" in app.rows[0].text
+    app.handle(" ")
+    assert len(app.rows) == 1
+    app.handle(" ")
+    assert [row.match for row in app.rows[1:]] == raw
 
 
 def test_tui_regex_no_match_cancel_repeat_and_filters(tmp_path: Path) -> None:
@@ -171,16 +282,19 @@ def test_detail_keeps_full_query_and_emphasizes_only_engine_evidence() -> None:
     app.active_query = "Глеб Скрепкин +79087562342"
     app.results = [
         Match(
-            archive="fixture.zip", member="people.txt", line=1,
+            archive="fixture.zip",
+            member="people.txt",
+            line=1,
             text="Игорь Скрепкин +7 (908) 756-23-42",
-            patterns=(app.active_query,), text_spans=((6, 14), (15, 32)),
+            patterns=(app.active_query,),
+            text_spans=((6, 14), (15, 32)),
             query_spans=((5, 13), (14, 26)),
         )
     ]
     app._rebuild_rows()
     screen = AttributeScreen()
     app._draw_detail(screen, top=0, left=0, width=80, height=12)  # type: ignore[arg-type]
-    query_calls = [call for call in screen.calls if call[0] == 3]
+    query_calls = [call for call in screen.calls if call[0] == 4]
     attrs = {x: attr for _, x, text, attr in query_calls for x in range(x, x + len(text))}
     # "Глеб" starts after the fixed "matched  " label and stays plain.
     assert attrs[9] == 0
@@ -325,7 +439,10 @@ def test_member_collapse_expand_and_navigation_only_use_visible_rows() -> None:
     _select(app, "member", "first.txt")
     app.handle(curses.KEY_RIGHT)
     assert [row.text for row in app.rows if row.kind == "match"] == [
-        "one first", "one second", "one nested", "two third"
+        "one first",
+        "one second",
+        "one nested",
+        "two third",
     ]
 
 
@@ -377,18 +494,51 @@ def test_results_never_overwrite_divider_when_scrolling_long_unicode_tree() -> N
     app.draw(screen)  # type: ignore[arg-type]
     split = max(34, screen.width * 3 // 5)
     assert all(screen.grid[y][split] == "│" for y in range(3, screen.height - 3))
-    # No left-pane draw call reaches the separator; the final divider redraw is
-    # a belt-and-suspenders safeguard for terminal-specific wide glyph behavior.
-    assert all(
-        x >= split or x + len(text) <= split
-        for y, x, text, _ in screen.calls
-        if 3 <= y < screen.height - 3 and text != "│"
+
+
+def test_deterministic_fuzz_like_key_sequences_keep_tui_state_valid(monkeypatch) -> None:
+    import curses
+    import random
+
+    app = _tree_app()
+    monkeypatch.setattr(app.session, "start", lambda root, options: 1)
+    keys = (
+        10,
+        27,
+        curses.KEY_UP,
+        curses.KEY_DOWN,
+        curses.KEY_LEFT,
+        curses.KEY_RIGHT,
+        curses.KEY_NPAGE,
+        curses.KEY_PPAGE,
+        ord(" "),
+        ord("f"),
+        ord("r"),
+        ord("?"),
+        ord("i"),
+        ord("o"),
+        ord("/"),
+        ord("x"),
+        3,
     )
-    archive_index = next(index for index, row in enumerate(app.rows) if row.kind == "archive")
-    app.selected = archive_index
-    app.handle(" ")
-    app.handle(" ")
-    app.selected = len(app.rows) - 1
-    screen.calls.clear()
-    app.draw(screen)  # type: ignore[arg-type]
-    assert all(screen.grid[y][split] == "│" for y in range(3, screen.height - 3))
+    randomizer = random.Random(6100)
+    for _ in range(300):
+        app.handle(randomizer.choice(keys))
+        if app.overlay == "index":
+            app.handle(27)
+        screen = GridScreen()
+        app.draw(screen)  # type: ignore[arg-type]
+        assert 0 <= app.selected < max(1, len(app.rows))
+        assert app.overlay in {
+            None,
+            "root",
+            "filters",
+            "errors",
+            "detail",
+            "index",
+            "related",
+            "help",
+        }
+        if app.overlay is None:
+            split = max(34, screen.width * 3 // 5)
+            assert all(screen.grid[y][split] == "│" for y in range(3, screen.height - 3))

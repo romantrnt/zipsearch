@@ -36,7 +36,7 @@ def render_summary(summary: Summary, output: TextIO | None = None) -> None:
         "zipsearch: "
         f"archives={summary.archives_completed}/{summary.archives_seen} "
         f"members={summary.members_scanned}/{summary.members_seen} "
-        f"matches={summary.matches} issues={summary.issues}",
+        f"matches={summary.matches} issues={summary.issues} path={summary.execution_path}",
         file=output,
     )
 

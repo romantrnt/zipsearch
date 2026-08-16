@@ -11,12 +11,22 @@ import re
 import threading
 import time
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 
-from .engine import SearchConfigurationError, discover_archives, rank_matches, scan_archives
+from .engine import SearchConfigurationError, rank_matches
+from .entities import extract as extract_entities
+from .execution import SearchPlan, execute_plan, plan_search
+from .grouping import group
+from .index import build_or_update, default_index_path
+from .index import clean as clean_index
+from .index import status as index_status
 from .models import ArchiveScan, Issue, Match, SafetyLimits, SearchOptions, Summary
+from .smart import _PHONE_COMPONENT, phone_digits
+from .state import LocalState, default_state_path
+from .state import load as load_state
+from .state import save as save_state
 
 
 def _patterns(value: str) -> tuple[str, ...]:
@@ -38,6 +48,7 @@ class Row:
     archive: str = ""
     member: str = ""
     nested_path: tuple[str, ...] = ()
+    group_key: str = ""
 
 
 class SearchSession:
@@ -57,8 +68,9 @@ class SearchSession:
 
         def runner() -> None:
             try:
-                paths = discover_archives(root, recursive=True)
-                for scan in scan_archives(iter(paths), options, self.cancelled):
+                plan = plan_search(root, options)
+                self.events.put(("plan", plan, generation))
+                for scan in execute_plan(root, options, plan, cancelled=self.cancelled):
                     if self.cancelled.is_set():
                         break
                     self.events.put(("scan", scan, generation))
@@ -75,11 +87,57 @@ class SearchSession:
         self.cancelled.set()
 
 
+class IndexSession:
+    """Background local-index operation controller for the compact TUI overlay."""
+
+    def __init__(self) -> None:
+        self.events: queue.Queue[tuple[str, object]] = queue.Queue()
+        self.cancelled = threading.Event()
+        self.thread: threading.Thread | None = None
+
+    def start(self, root: Path, operation: str, limits: SafetyLimits) -> None:
+        self.cancelled = threading.Event()
+
+        def progress(value: dict[str, int]) -> None:
+            self.events.put(("progress", value))
+
+        def runner() -> None:
+            try:
+                path = default_index_path(root)
+                if operation in {"build", "update"}:
+                    result, issues = build_or_update(
+                        root,
+                        path,
+                        limits,
+                        rebuild=operation == "build",
+                        cancelled=self.cancelled,
+                        progress=progress,
+                    )
+                    self.events.put(("done", (operation, result, issues)))
+                elif operation == "verify":
+                    self.events.put(
+                        ("done", (operation, index_status(root, path, verify_integrity=True), []))
+                    )
+                else:
+                    clean_index(path)
+                    self.events.put(("done", (operation, index_status(root, path), [])))
+            except Exception as exc:
+                self.events.put(("error", str(exc)))
+
+        self.thread = threading.Thread(target=runner, name="zipsearch-index", daemon=True)
+        self.thread.start()
+
+    def cancel(self) -> None:
+        self.cancelled.set()
+
+
 class ZipSearchTui:
     """Dense terminal UI inspired by classic operational tools, not GUI widgets."""
 
-    def __init__(self, root: Path | None = None) -> None:
+    def __init__(self, root: Path | None = None, *, state_path: Path | None = None) -> None:
         self.root = root or Path.cwd()
+        self.state_path = state_path
+        self.local_state = load_state(state_path) if state_path is not None else LocalState()
         self.query = ""
         self.mode = "SMART"
         self.editing = True
@@ -87,6 +145,7 @@ class ZipSearchTui:
         self.message = "Type a query and press Enter. Commas add patterns."
         self.options = SearchOptions(patterns=("_",))
         self.session = SearchSession()
+        self.index_session = IndexSession()
         self.generation = 0
         self.results: list[Match] = []
         self.issues: list[Issue] = []
@@ -94,6 +153,8 @@ class ZipSearchTui:
         self.rows: list[Row] = []
         self.collapsed_archives: set[str] = set()
         self.collapsed_members: set[tuple[str, str, tuple[str, ...]]] = set()
+        self.collapsed_groups: set[str] = set()
+        self.group_mode: str | None = None
         self.archive_scans: dict[str, ArchiveScan] = {}
         self.selected = 0
         self.offset = 0
@@ -102,13 +163,21 @@ class ZipSearchTui:
         self.search_elapsed = 0.0
         self.overlay: str | None = None
         self.filter_index = 0
-        self.history: list[str] = []
+        self.history: list[str] = list(self.local_state.history)
         self.history_index: int | None = None
         self.history_draft: str | None = None
-        self.root_history: list[Path] = [self.root]
+        self.root_history: list[Path] = [Path(item) for item in self.local_state.roots if item]
+        if self.root not in self.root_history:
+            self.root_history.append(self.root)
         self.root_history_index: int | None = None
         self.root_buffer = str(self.root)
         self.active_query = ""
+        self.index_state = "NONE"
+        self.execution_path = "SCAN"
+        self.index_progress: dict[str, int] = {}
+        self.index_started: float | None = None
+        self.related_entities: list[tuple[str, str]] = []
+        self.related_index = 0
         self.color_attr = 0
         self._colors_initialized = False
         self.settings: list[list[str]] = [
@@ -125,6 +194,25 @@ class ZipSearchTui:
             ["max members", "100000"],
             ["max ratio", "200"],
         ]
+        self._refresh_index_state()
+
+    def _save_local_state(self) -> None:
+        if self.state_path is None:
+            return
+        self.local_state.history = self.history[-200:]
+        self.local_state.roots = [str(item) for item in self.root_history[-50:]]
+        try:
+            save_state(self.state_path, self.local_state)
+        except OSError:
+            # Convenience state must never make an offline corpus unsearchable.
+            pass
+
+    def _refresh_index_state(self) -> None:
+        """Read index health once per meaningful state transition, never per draw."""
+        try:
+            self.index_state = index_status(self.root, default_index_path(self.root)).state
+        except (OSError, ValueError):
+            self.index_state = "UNAVAILABLE"
 
     def build_options(self) -> SearchOptions:
         patterns = _patterns(self.query)
@@ -169,14 +257,20 @@ class ZipSearchTui:
             return
         if self.query not in self.history:
             self.history.append(self.query)
+            self._save_local_state()
         self.active_query = self.query
+        self._refresh_index_state()
         self.history_index = None
         self.results, self.issues, self.rows = [], [], []
-        self.collapsed_archives, self.collapsed_members, self.archive_scans = set(), set(), {}
+        self.collapsed_archives = set()
+        self.collapsed_members = set()
+        self.collapsed_groups = set()
+        self.archive_scans = {}
         self.summary, self.selected, self.offset = Summary(), 0, 0
         self.search_started = time.perf_counter()
         self.search_elapsed = 0.0
-        self.state, self.message = "SEARCHING", "Scanning archives…"
+        self.execution_path = "SCAN"
+        self.state, self.message = "SEARCHING", "Planning search…"
         self.generation = self.session.start(self.root, self.options)
 
     def search_duration(self) -> float:
@@ -199,6 +293,19 @@ class ZipSearchTui:
             self.session.cancel()
             self._freeze_search_duration()
             self.state, self.message = "CANCELLED", "Search cancelled; safe cleanup in progress."
+        elif self.state == "INDEXING":
+            self.index_session.cancel()
+            self.message = "Index cancellation requested; completed archives remain resumable."
+
+    def start_index_operation(self, operation: str) -> None:
+        if self.state == "SEARCHING":
+            self.message = "Cancel the active search before changing the index."
+            return
+        self.index_progress = {}
+        self.index_started = time.perf_counter()
+        self.state = "INDEXING"
+        self.message = f"Index {operation} started…"
+        self.index_session.start(self.root, operation, self.options.limits)
 
     def apply_root(self, value: str) -> bool:
         """Validate and switch roots without losing query/options or retaining stale hits."""
@@ -220,12 +327,17 @@ class ZipSearchTui:
         self.session.cancel()
         self.generation = -1
         self.root = candidate
+        self._refresh_index_state()
         self.root_buffer = str(candidate)
         if candidate not in self.root_history:
             self.root_history.append(candidate)
+        self._save_local_state()
         self.root_history_index = None
         self.results, self.issues, self.rows = [], [], []
-        self.collapsed_archives, self.collapsed_members, self.archive_scans = set(), set(), {}
+        self.collapsed_archives = set()
+        self.collapsed_members = set()
+        self.collapsed_groups = set()
+        self.archive_scans = {}
         self.summary, self.selected, self.offset = Summary(), 0, 0
         self.state, self.message = "IDLE", "Root changed. Press Enter to search this root."
         return True
@@ -236,10 +348,20 @@ class ZipSearchTui:
             try:
                 kind, payload, generation = self.session.events.get_nowait()
             except queue.Empty:
-                return
+                break
             if generation != self.generation:
                 continue
-            if kind == "scan":
+            if kind == "plan":
+                plan = payload
+                assert isinstance(plan, SearchPlan)
+                self.execution_path = plan.execution.upper()
+                self.index_state = plan.index.state
+                self.message = (
+                    "Verifying indexed candidates…"
+                    if plan.indexed
+                    else f"Scanning archives ({plan.reason})…"
+                )
+            elif kind == "scan":
                 scan = payload
                 assert isinstance(scan, ArchiveScan)
                 self.summary.archives_seen += 1
@@ -248,13 +370,18 @@ class ZipSearchTui:
                 self.summary.members_scanned += scan.members_scanned
                 self.issues.extend(scan.issues)
                 self.archive_scans[str(scan.archive)] = scan
+                matches = (
+                    [replace(match, execution_path="index") for match in scan.matches]
+                    if self.execution_path == "INDEX"
+                    else scan.matches
+                )
                 if self.options.smart:
-                    self.results.extend(scan.matches)
+                    self.results.extend(matches)
                     if len(self.results) > self.options.max_matches * 2:
                         self.results = rank_matches(iter(self.results), self.options.max_matches)
                 else:
                     remaining = self.options.max_matches - len(self.results)
-                    self.results.extend(scan.matches[:remaining])
+                    self.results.extend(matches[:remaining])
                 self._rebuild_rows()
             elif kind == "error":
                 self._freeze_search_duration()
@@ -268,10 +395,51 @@ class ZipSearchTui:
                     self.state = "COMPLETE"
                     self.message = "No matches." if not self.results else "Search complete."
         self.summary.matches, self.summary.issues = len(self.results), len(self.issues)
+        for _ in range(8):
+            try:
+                kind, payload = self.index_session.events.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "progress":
+                assert isinstance(payload, dict)
+                self.index_progress = payload
+            elif kind == "error":
+                self.state, self.message = "ERROR", str(payload)
+            else:
+                operation, result, issues = payload
+                self.index_state = result.state
+                self.issues.extend(issues)
+                self.state = "IDLE"
+                self.message = f"Index {operation}: {result.state}."
 
     def _rebuild_rows(self) -> None:
         selected_key = self._row_key(self.selected_row())
         rows: list[Row] = []
+        if self.group_mode:
+            for item in group(self.results, self.group_mode):
+                rows.append(
+                    Row(
+                        "group",
+                        f"{item.key}  ({len(item.occurrences)} occurrences)",
+                        group_key=item.key,
+                    )
+                )
+                if item.key not in self.collapsed_groups:
+                    rows.extend(
+                        Row(
+                            "match",
+                            match.text,
+                            match,
+                            match.archive,
+                            match.member,
+                            match.nested_path,
+                            item.key,
+                        )
+                        for match in item.occurrences
+                    )
+            self.rows = rows
+            self._restore_selection(selected_key)
+            return
         groups: dict[tuple[str, str, tuple[str, ...]], list[Match]] = {}
         for match in self.results:
             groups.setdefault((match.archive, match.member, match.nested_path), []).append(match)
@@ -311,6 +479,10 @@ class ZipSearchTui:
                 Row("match", match.text, match, archive, member, nested_path) for match in matches
             )
         self.rows = rows
+        self._restore_selection(selected_key)
+
+    def _restore_selection(self, selected_key: tuple[object, ...] | None) -> None:
+        rows = self.rows
         restored = next(
             (index for index, row in enumerate(rows) if self._row_key(row) == selected_key), None
         )
@@ -338,12 +510,24 @@ class ZipSearchTui:
             row.archive,
             row.member,
             row.nested_path,
+            row.group_key,
             row.match.line if row.match else None,
         )
 
     def _toggle_tree(self, expand: bool | None = None) -> None:
         row = self.selected_row()
         if row is None or row.kind == "match":
+            return
+        if row.kind == "group":
+            if expand is True:
+                self.collapsed_groups.discard(row.group_key)
+            elif expand is False:
+                self.collapsed_groups.add(row.group_key)
+            elif row.group_key in self.collapsed_groups:
+                self.collapsed_groups.remove(row.group_key)
+            else:
+                self.collapsed_groups.add(row.group_key)
+            self._rebuild_rows()
             return
         target = self.collapsed_archives if row.kind == "archive" else self.collapsed_members
         key: str | tuple[str, str, tuple[str, ...]] = (
@@ -376,6 +560,51 @@ class ZipSearchTui:
                 (m.archive, m.member, m.line, m.text, ";".join(m.patterns)) for m in self.results
             )
         return f"Exported {len(self.results)} results: {base.name}.{{jsonl,csv,txt}}"
+
+    def related_value(self) -> None:
+        """Choose a deterministic local value, then re-run the shared planner."""
+        match = self.selected_match()
+        if match is None:
+            self.message = "Select a result containing a deterministic entity."
+            return
+        phone = next(
+            (
+                phone_digits(found.group())
+                for found in _PHONE_COMPONENT.finditer(match.text)
+                if len(phone_digits(found.group())) >= 7
+            ),
+            "",
+        )
+        extracted = extract_entities(match.text)
+        entities: list[tuple[str, str]] = [("phone", "+" + phone)] if phone else []
+        email = next((value for kind, value in extracted if kind == "email"), "")
+        if email and not phone:
+            # Preserve the established immediate exact-email behavior. The
+            # email's derived domain is navigation metadata, not a competing
+            # chooser entry unless another independent entity is present.
+            entities.append(("email", email))
+            entities.extend(item for item in extracted if item[0] not in {"email", "domain"})
+        else:
+            entities.extend(extracted)
+        if not entities:
+            self.message = "No deterministic related value in this record."
+            return
+        self.related_entities = list(dict.fromkeys(entities))
+        self.related_index = 0
+        if len(self.related_entities) > 1:
+            self.overlay = "related"
+            return
+        self._start_related(*self.related_entities[0])
+
+    def _start_related(self, kind: str, value: str) -> None:
+        if kind == "phone":
+            self.query, self.mode = value, "SMART"
+        else:
+            self.query, self.mode = value, "LITERAL"
+        self.editing = False
+        self.overlay = None
+        self.message = f"Related exact {kind} occurrences for {value}."
+        self.run_search()
 
     def draw(self, screen: curses.window) -> None:
         self._init_colors()
@@ -416,8 +645,19 @@ class ZipSearchTui:
             f"E:{len(self.issues)} S:{search_duration:5.1f}s "
             f"U:{session_uptime:5.1f}s J:{self.options.workers}"
         )
+        if self.state == "INDEXING":
+            elapsed = time.perf_counter() - self.index_started if self.index_started else 0.0
+            runtime += (
+                f" B:{self.index_progress.get('archives_completed', 0)}/"
+                f"{self.index_progress.get('archives_total', '?')} "
+                f"R:{self.index_progress.get('records_indexed', 0)}"
+                f" T:{elapsed:4.1f}s"
+            )
         hits = f"H:{len(self.results)}{cap}"
-        status = f" {self.state:<10} {archives} {members} {hits} {runtime}"
+        status = (
+            f" {self.state:<10} I:{self.index_state} P:{self.execution_path} "
+            f"{archives} {members} {hits} {runtime}"
+        )
         status += f" D:{self.options.limits.max_nested_depth} "
         self._safe_add(screen, height - 3, 2, status[: width - 4], curses.A_REVERSE)
         self._safe_add(
@@ -426,7 +666,7 @@ class ZipSearchTui:
             2,
             (
                 "/ query  Enter run/detail  r root  m mode  c case  f filters  "
-                "x errors  e export  Ctrl-C cancel  ? help  q quit"
+                "i index  g grouping  o related  x errors  e export  Ctrl-C cancel  ? help  q quit"
             )[: width - 4],
             curses.A_DIM,
         )
@@ -441,6 +681,11 @@ class ZipSearchTui:
     def _draw_results(
         self, screen: curses.window, top: int, left: int, width: int, rows: int
     ) -> None:
+        if not self.rows:
+            self.selected = self.offset = 0
+            return
+        self.selected = min(max(0, self.selected), len(self.rows) - 1)
+        self.offset = min(max(0, self.offset), len(self.rows) - 1)
         if self.selected < self.offset:
             self.offset = self.selected
         if self.selected >= self.offset + rows:
@@ -448,7 +693,12 @@ class ZipSearchTui:
         for visual, index in enumerate(range(self.offset, min(len(self.rows), self.offset + rows))):
             row = self.rows[index]
             attr = curses.A_REVERSE if index == self.selected else 0
-            if row.kind == "archive":
+            if row.kind == "group":
+                marker = "▸" if row.group_key in self.collapsed_groups else "▾"
+                self._safe_add_clipped(
+                    screen, top + visual, left, marker + " " + row.text, attr | curses.A_BOLD, width
+                )
+            elif row.kind == "archive":
                 marker = "▸" if row.archive in self.collapsed_archives else "▾"
                 self._safe_add_clipped(
                     screen,
@@ -505,7 +755,13 @@ class ZipSearchTui:
         self._draw_spans(screen, y, x, match.text, width, base, match.text_spans)
 
     def _draw_spans(
-        self, screen: curses.window, y: int, x: int, text: str, width: int, base: int,
+        self,
+        screen: curses.window,
+        y: int,
+        x: int,
+        text: str,
+        width: int,
+        base: int,
         spans: tuple[tuple[int, int], ...],
     ) -> None:
         x_offset = 0
@@ -515,7 +771,8 @@ class ZipSearchTui:
                 break
             attr = base | (
                 curses.A_BOLD | curses.A_UNDERLINE | self.color_attr
-                if any(start <= index < end for start, end in spans) else 0
+                if any(start <= index < end for start, end in spans)
+                else 0
             )
             self._safe_add(screen, y, x + x_offset, char, attr)
             x_offset += cell_width
@@ -571,11 +828,14 @@ class ZipSearchTui:
                 f"archive  {Path(match.archive).name}",
                 f"member   {member}",
                 f"line     {match.line}",
+                f"path     {match.execution_path.upper()}",
                 "matched  " + query,
                 "",
                 "record",
                 match.text,
             ]
+            if match.provenance:
+                lines += ["", "source"] + [f"{key:<8} {value}" for key, value in match.provenance]
             if match.context_before:
                 lines += ["", "before"] + list(match.context_before)
             if match.context_after:
@@ -583,7 +843,7 @@ class ZipSearchTui:
         else:
             lines = self._node_detail_lines(row)
         for index, line in enumerate(lines[:height]):
-            if match and index == 3:
+            if match and index == 4:
                 prefix = "matched  "
                 self._safe_add_clipped(screen, top + index, left, prefix, 0, width)
                 self._draw_spans(
@@ -595,7 +855,7 @@ class ZipSearchTui:
                     0,
                     self._query_spans(match, query),
                 )
-            elif match and index == 6:
+            elif match and index == 7:
                 self._draw_spans(screen, top + index, left, line, width, 0, match.text_spans)
             else:
                 self._safe_add_clipped(screen, top + index, left, line, 0, width)
@@ -700,12 +960,13 @@ class ZipSearchTui:
                 if row is None
                 else (
                     [
-                    f"archive: {match.archive}",
-                    f"member: {' ! '.join((*match.nested_path, match.member))}",
-                    f"line: {match.line}  type: {match.match_type}  score: {match.score}",
-                    "",
-                    match.text,
-                ]
+                        f"archive: {match.archive}",
+                        f"member: {' ! '.join((*match.nested_path, match.member))}",
+                        f"line: {match.line}  path: {match.execution_path} "
+                        f"type: {match.match_type}  score: {match.score}",
+                        "",
+                        match.text,
+                    ]
                     if match
                     else self._node_detail_lines(row)
                 )
@@ -713,6 +974,46 @@ class ZipSearchTui:
             for index, line in enumerate(lines[: box_height - 2]):
                 self._safe_add(
                     screen, top + 2 + index, left + 2, line[: box_width - 4], curses.A_REVERSE
+                )
+        elif self.overlay == "related":
+            self._safe_add(
+                screen,
+                top + 1,
+                left + 2,
+                "↑↓ select · Enter searches exact local occurrences · Esc closes",
+                curses.A_DIM | curses.A_REVERSE,
+            )
+            for index, (kind, value) in enumerate(self.related_entities[: box_height - 3]):
+                marker = ">" if index == self.related_index else " "
+                self._safe_add(
+                    screen,
+                    top + 2 + index,
+                    left + 2,
+                    f"{marker} {kind:<7} {value}"[: box_width - 4],
+                    curses.A_REVERSE if index == self.related_index else 0,
+                )
+        elif self.overlay == "index":
+            value = index_status(self.root, default_index_path(self.root))
+            elapsed = time.perf_counter() - self.index_started if self.index_started else 0.0
+            lines = [
+                "b build  u update  v verify  d clean  Ctrl-C cancel  Esc close",
+                f"state    {value.state}    path  {value.path}",
+                f"archives {value.archives}  members {value.members}  records {value.records}",
+                f"terms    {value.terms}  phones {value.phones}  index {value.bytes} bytes",
+                f"stale    new:{value.new} changed:{value.changed} removed:{value.removed}",
+                f"source   compressed:{value.source_compressed_bytes} "
+                f"expanded:{value.source_expanded_bytes}",
+                (
+                    f"progress {self.index_progress.get('archives_completed', 0)}/"
+                    f"{self.index_progress.get('archives_total', 0)} members:"
+                    f"{self.index_progress.get('members_processed', 0)} records:"
+                    f"{self.index_progress.get('records_indexed', 0)} elapsed:{elapsed:.1f}s"
+                ),
+                self.message,
+            ]
+            for index, line in enumerate(lines[: box_height - 2]):
+                self._safe_add(
+                    screen, top + 1 + index, left + 2, line[: box_width - 4], curses.A_REVERSE
                 )
         else:
             lines = [
@@ -830,12 +1131,27 @@ class ZipSearchTui:
             self.message = f"Case {'on' if self.case else 'off'}"
         elif key == ord("f"):
             self.overlay = "filters"
+        elif key == ord("i"):
+            self.overlay = "index"
+        elif key == ord("g"):
+            modes = (None, "exact", "phone", "email", "entity")
+            self.group_mode = modes[(modes.index(self.group_mode) + 1) % len(modes)]
+            self.collapsed_groups.clear()
+            self._rebuild_rows()
+            self.selected = self.offset = 0
+            self.message = (
+                "Raw occurrences view."
+                if self.group_mode is None
+                else f"Grouped by {self.group_mode}; Enter or Space drills into occurrences."
+            )
         elif key == ord("x"):
             self.overlay = "errors"
         elif key == ord("?"):
             self.overlay = "help"
         elif key == ord("e"):
             self.message = self.export()
+        elif key == ord("o"):
+            self.related_value()
         elif key in (ord("j"), curses.KEY_DOWN):
             self.selected = min(len(self.rows) - 1, self.selected + 1)
         elif key in (ord("k"), curses.KEY_UP):
@@ -856,6 +1172,24 @@ class ZipSearchTui:
             return True
         if self.overlay == "root":
             return self._handle_root_overlay(key)
+        if self.overlay == "index":
+            if key == 3:
+                self.cancel()
+            elif key in (ord("b"), ord("u"), ord("v"), ord("d")):
+                self.start_index_operation(
+                    {ord("b"): "build", ord("u"): "update", ord("v"): "verify", ord("d"): "clean"}[
+                        key
+                    ]
+                )
+            return True
+        if self.overlay == "related":
+            if key in (curses.KEY_UP, ord("k")):
+                self.related_index = max(0, self.related_index - 1)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                self.related_index = min(len(self.related_entities) - 1, self.related_index + 1)
+            elif key in (10, 13, curses.KEY_ENTER) and self.related_entities:
+                self._start_related(*self.related_entities[self.related_index])
+            return True
         if self.overlay != "filters":
             self.overlay = None
             return True
@@ -888,12 +1222,13 @@ class ZipSearchTui:
             self.root_history_index = (
                 len(self.root_history) - 1
                 if self.root_history_index is None
+                or self.root_history_index >= len(self.root_history)
                 else max(0, self.root_history_index - 1)
             )
             self.root_buffer = str(self.root_history[self.root_history_index])
             return True
         if key == curses.KEY_DOWN and self.root_history_index is not None:
-            self.root_history_index += 1
+            self.root_history_index = min(self.root_history_index + 1, len(self.root_history))
             self.root_buffer = (
                 str(self.root_history[self.root_history_index])
                 if self.root_history_index < len(self.root_history)
@@ -907,13 +1242,13 @@ class ZipSearchTui:
         return True
 
 
-def _curses_main(screen: curses.window, root: Path | None) -> None:
+def _curses_main(screen: curses.window, root: Path | None, no_state: bool = False) -> None:
     try:
         curses.curs_set(1)
     except curses.error:
         pass
     screen.timeout(75)
-    app = ZipSearchTui(root)
+    app = ZipSearchTui(root, state_path=None if no_state else default_state_path())
     running = True
     while running:
         app.drain()
@@ -927,7 +1262,7 @@ def _curses_main(screen: curses.window, root: Path | None) -> None:
     app.cancel()
 
 
-def run_tui(initial_path: Path | None = None) -> int:
+def run_tui(initial_path: Path | None = None, *, no_state: bool = False) -> int:
     locale.setlocale(locale.LC_ALL, "")
-    curses.wrapper(_curses_main, initial_path)
+    curses.wrapper(_curses_main, initial_path, no_state)
     return 0

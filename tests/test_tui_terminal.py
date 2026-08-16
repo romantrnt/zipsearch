@@ -60,4 +60,3 @@ def test_tui_pty_submits_unicode_query_to_the_real_engine(tmp_path: Path) -> Non
     assert os.waitstatus_to_exitcode(status) == 0
     assert "COMPLETE" in rendered
     assert "Скрепкин Игорь" in rendered
-

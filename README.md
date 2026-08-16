@@ -14,7 +14,25 @@ ZipSearch is a local terminal tool for searching heterogeneous collections store
 
 The keyboard-first TUI keeps the archive, member, result, and record detail in one view for fast inspection.
 
-ZipSearch is the spiritual successor to `awerpars`, an earlier project whose ideas and lessons evolved into this independent implementation.
+## The Four Laws
+
+These are the core design rules of ZipSearch.
+
+### 1. The archive is the source of truth
+
+The original archive collection always remains authoritative. Indexes, metadata, grouping, and caches only accelerate access; they never replace or redefine the original data.
+
+### 2. Indexing is an optimization, never admission
+
+The index is optional acceleration. Search correctness never depends on it: if it is missing, stale, damaged, or unavailable, ZipSearch safely scans the source archives instead.
+
+### 3. Python is enough
+
+ZipSearch intentionally has no runtime third-party dependencies or external services. It remains portable, offline-capable, and inspectable with the Python standard library.
+
+### 4. Search the data where it lives
+
+ZipSearch works directly with archive members. It does not require a full corpus extraction or a persistent copied working tree.
 
 ## Why it exists
 
@@ -27,7 +45,8 @@ Large archive collections are awkward to inspect by hand. Expanding every archiv
 | Area | What ZipSearch provides |
 | --- | --- |
 | Search | Literal, regular-expression, and normalized token-aware SMART search |
-| Data | Text-like members, SQLite rows, XLSX worksheet rows, nested ZIPs |
+| Entities | Deterministic phones, emails/domains, URLs, IP addresses, UUIDs, and hashes; related-occurrence navigation in the TUI |
+| Data | Text-like members, SQLite rows, XLSX rows, DOCX/PPTX/ODT text, nested ZIPs |
 | Inspection | Archive → member → result tree; detail panel; central-directory inspection |
 | Operations | Include/exclude globs, extension filters, context, root switching, export, cancellation |
 | Controls | Member/count/expanded-size/compression-ratio/nesting limits; recoverable issue reporting |
@@ -48,6 +67,15 @@ python -m pip install -e . pytest ruff
 ```
 
 Running `zipsearch` with no arguments opens the TUI only when both standard input and output are terminals. In scripts, use an explicit subcommand.
+
+For an offline, single-file Python application from a source checkout:
+
+```console
+python tools/build_zipapp.py zipsearch.pyz
+python zipsearch.pyz search ./archives needle
+```
+
+The zipapp bundles ZipSearch only; Python 3.10+ remains the runtime.
 
 ## Quick start
 
@@ -74,6 +102,51 @@ zipsearch inspect evidence.zip --json
 
 Run `zipsearch search --help` for the complete CLI reference.
 
+## Architecture and indexing
+
+Every result is produced from the source archive and carries its archive, member, nested path, record locator, matching evidence, structured provenance, and execution path. The planner chooses one of three transparent paths:
+
+| Path | Operation | Correctness boundary |
+| --- | --- | --- |
+| **SCAN** | Stream eligible source members directly. | The baseline engine; no index is required. |
+| **INDEX** | Retrieve compact candidate locators, reopen only selected source member routes, and verify matches with the shared matcher. | The index never emits a result on its own. |
+| **HYBRID** | Verify fresh indexed coverage and directly scan changed, new, or otherwise uncovered archives. | Incomplete generated state cannot hide a source result. |
+
+### Optional local index
+
+Direct scanning is always available and remains the default on a fresh corpus. An index is a
+disposable SQLite candidate map, not an import of archive contents: it stores normalized terms,
+phone postings, and compact archive-local unit/line locators, but not record text. Posting segments
+use a versioned delta-varint envelope with checksum validation; singleton values stay inline until
+they appear in another archive. Indexed candidates are
+reopened from original ZIP files and verified by the same LITERAL or SMART matcher before output.
+The verifier opens only indexed archives and selected member routes; it never claims impossible
+random access inside a deflated member, which still must be decompressed to recover its record.
+
+```console
+zipsearch index build ./archives
+zipsearch index status ./archives
+zipsearch search ./archives needle --no-index
+zipsearch search ./archives 'Глеб Скрепкин +79087562342' --smart --explain
+zipsearch index update ./archives
+zipsearch index verify ./archives
+zipsearch index clean ./archives
+```
+
+The default index is `.zipsearch.sqlite` beside a directory corpus (or beside a single archive).
+Use `--index-path PATH` for another cache location, including a read-only corpus. A missing,
+schema-incompatible, or corrupt index is never trusted and falls back to direct scan. For a stale or
+BUILDING index, verified clean archive coverage can be used with direct scanning of changed/new
+archives (`HYBRID`); incomplete generated state never hides a source result.
+`index update` is resumable at archive transaction boundaries; fingerprints combine stat data with
+ZIP central-directory metadata without bulk hashing archive payloads.
+
+When an index is READY, an explainable planner still may select direct scanning. It uses candidate
+archive/member coverage rather than an opaque score: selective terms and normalized phones use
+`INDEX`; broad SMART candidates that would reopen nearly every member use `SCAN`; mixed freshness
+uses `HYBRID`. `--explain` shows
+the reason and candidate/total archive and member counts.
+
 ## Search semantics
 
 | Mode | Selection rule | Ordering |
@@ -94,11 +167,18 @@ For example, `Глеб Скрепкин +79087562342` can match `Игорь Ск
 
 `match_type` and `score` appear in JSONL output and result-detail inspection. A score is an internal ordering signal, not a percentage or a cross-query relevance measure.
 
+### Advanced queries and grouping
+
+`--advanced` accepts one Boolean query with quoted phrases, implicit or explicit `AND`, `OR`, `NOT`, parentheses, token prefixes (`name*`), and deterministic selectors: `archive:`, `member:`, `format:`, `table:`, `sheet:`, `fields:`, `phone:`, and `email:`. Advanced expressions are source-verified and currently use direct scanning deliberately: complex Boolean and record-metadata semantics are not approximated by the candidate index.
+
+Raw occurrences are the default. `--group-by exact|phone|email|entity` is an output presentation layer: human output prints each grouped occurrence, and JSONL emits a stable `group` object containing the complete raw match objects, including archive, member, locator, provenance, and execution path.
+
 ## TUI
 
 `zipsearch tui [PATH]` opens a keyboard-first interface with an editable query line, a RESULTS pane, a DETAIL pane, and a compact status/footer area.
 
 - **RESULTS** is a tree: archive → member → matching record. Archive and member nodes can be collapsed without changing the loaded result set, ranking, or search.
+- Press **g** to cycle raw, exact, phone, email, and entity grouping. A group displays its occurrence count; Space or Enter collapses/opens its raw occurrences without discarding them.
 - **DETAIL** shows the selected record, including the full original `matched` query and only the query components that contributed to that result. It also renders available archive/member metadata when a tree node is selected.
 - Match evidence is underlined and may receive one restrained terminal accent color when curses color support is available. Monochrome terminals retain attribute-based highlighting. The selected row remains reverse-video.
 - The status line reports archive/member counts, hits, issues, workers, nesting depth, **S** (current or last search duration), and **U** (continuously increasing TUI uptime).
@@ -117,12 +197,13 @@ For example, `Глеб Скрепкин +79087562342` can match `Игорь Ск
 | <kbd>m</kbd> | Cycle SMART → LITERAL → REGEX |
 | <kbd>c</kbd> | Toggle case sensitivity |
 | <kbd>f</kbd> | Open filters and limits |
+| <kbd>g</kbd> | Cycle raw/exact/phone/email/entity grouping |
 | <kbd>x</kbd> | Show recoverable issues |
 | <kbd>e</kbd> | Export current results as JSONL, CSV, and text files |
 | <kbd>Ctrl-C</kbd> | Cancel an active search |
 | <kbd>?</kbd> / <kbd>q</kbd> | Help / quit |
 
-Comma-separated TUI query components become separate patterns. Root changes preserve the query and settings but discard stale results. Query history is bounded by the entries accumulated in the session and returns to the current editable draft after the newest entry.
+Comma-separated TUI query components become separate patterns. Root changes preserve the query and settings but discard stale results. Query history is bounded by the entries accumulated in the session and returns to the current editable draft after the newest entry. Unless `--no-state` is supplied, TUI history and recent roots are stored as a small, capped local JSON file (`$XDG_STATE_HOME/zipsearch/state.json`, or the platform-local default). Corrupt, unavailable, read-only, or missing state is ignored; it never affects searching and contains no corpus records.
 
 ## Data and archive support
 
@@ -132,6 +213,7 @@ Comma-separated TUI query components become separate patterns. Root changes pres
 | Text-like members | `.txt`, `.csv`, `.tsv`, `.log`, `.json`, `.jsonl`, `.xml`, `.html`, `.htm`, `.md`, `.rst`, `.yaml`, `.yml`, `.ini`, `.cfg`, `.conf`, `.dat`, `.tad`, `.cpy` | Line-oriented decoding and search |
 | SQLite | `.db`, `.sqlite`, `.sqlite3` | Read-only table rows rendered as searchable records |
 | XLSX | `.xlsx` | Worksheet XML rows and shared strings rendered as searchable records |
+| Office text | `.docx`, `.pptx`, `.odt` | Primary document, slide, note, header/footer, or content XML text rendered as records |
 
 By default, members outside those extensions are skipped. `--extension EXT` selects extensions explicitly; extension, include, and exclude filters are applied to member paths. Text decoding is `auto`: UTF-8 when possible, otherwise CP1251; pass `--encoding CODEC` when the source encoding is known. A NUL byte in the initial text probe causes the member to be skipped as binary.
 
@@ -152,6 +234,9 @@ Nested ZIP paths are shown with `!`, for example `outer.zip:inner.zip!records.tx
 | `--exclude GLOB` | — | Skip matching member paths or basenames; repeatable |
 | `--extension EXT` | — | Scan only selected extension(s); repeatable |
 | `--no-recursive` | off | Do not descend below the input directory |
+| `--no-index` | off | Force direct streaming scan even when an index is READY |
+| `--index-path PATH` | — | Read a disposable index from this location |
+| `--explain` | off | Report INDEX/SCAN selection and candidate planning to stderr |
 | `--jsonl` | off | Write match objects and final summary as JSON Lines |
 | `-q`, `--quiet` | off | Suppress human summary and warnings |
 
@@ -174,9 +259,9 @@ Malformed archives, unreadable/unsupported members, decoding or parser failures,
 
 ## Storage behavior
 
-ZipSearch never calls `extractall`. Ordinary text members are opened from the archive and read incrementally. SQLite requires random access, so that member alone is copied to an automatically removed temporary directory and opened read-only. XLSX and nested ZIP processing use spooled temporary files that remain in memory up to 8 MiB before using the system temporary area. Archive metadata shown by `inspect` comes from the central directory and does not decompress members.
+ZipSearch never calls `extractall`. Ordinary text members are opened from the archive and read incrementally. SQLite requires random access, so that member alone is copied to an automatically removed temporary directory and opened read-only. XLSX, Office documents, and nested ZIP processing use spooled temporary files that remain in memory up to 8 MiB before using the system temporary area. Every such copy is bounded again by the configured member limit; embedded XLSX ZIP metadata receives independent member/count/ratio checks. Archive metadata shown by `inspect` comes from the central directory and does not decompress members.
 
-## How it works
+## Direct scan path
 
 ```text
 root path → deterministic ZIP discovery → bounded archive workers
@@ -187,13 +272,26 @@ root path → deterministic ZIP discovery → bounded archive workers
 
 Directory discovery does not follow directory symlinks. Archive scanning uses a fixed-size thread pool and keeps at most two worker windows queued. SMART results are retained and ranked with a bounded top-N process so stronger later matches can displace weaker earlier ones.
 
-## Performance
+## Benchmarks
 
 Speed depends on archive count, compressed and expanded sizes, member formats, storage latency, query mode, filters, compression ratio, and worker count. The repository includes a small reproducible smoke benchmark; it is not a performance claim:
 
 ```console
 python benchmarks/benchmark.py
 ```
+
+It reports cold direct scan, initial index build, warm indexed query, index bytes, and result parity
+on generated local archives. Indexed LITERAL/SMART planning uses token and normalized-phone
+postings as a safe candidate superset; arbitrary regex remains direct because an inverted index
+cannot generally preserve Python regex semantics.
+
+`python benchmarks/index_benchmark.py` additionally generates rare, medium, common, phone, and
+multi-component SMART workloads. It reports candidate lookup and verification separately, including
+archives opened, members decompressed, declared verification bytes, index/source ratios, and parity.
+
+`python benchmarks/index_scaling.py` measures 12-, 36-, and 72-archive deterministic corpora,
+including unchanged-update cost. It intentionally reports both compressed and expanded source ratios:
+SQLite metadata has substantial fixed and posting overhead on small, highly repetitive collections.
 
 For a generated functional dataset exercised through the public CLI:
 
@@ -208,14 +306,25 @@ Use extension/include/exclude filters to avoid decoding irrelevant members. Incr
 
 </details>
 
+## Safety model
+
+Before a member is processed, ZipSearch checks entry counts, declared member and archive expansion sizes, compression ratios, unsafe paths, encryption, and nesting depth. Parser failures, malformed members, and unreadable archives become isolated issues so unrelated archives continue. Temporary random-access copies are automatically removed and are bounded independently while being read.
+
+These controls reduce exposure to hostile input; they do not replace operating-system isolation for untrusted archives.
+
 ## Limitations
 
 - ZIP is the only archive container supported.
 - Encrypted ZIP members are skipped; password input is not implemented.
 - XLSX handling reads worksheet values, not workbook formatting or formulas as a spreadsheet application would.
-- SQLite and XLSX processing create temporary data as described above.
+- SQLite and XLSX processing create temporary data as described above. The optional index is not a
+  full-text copy and is removable with `zipsearch index clean`.
 - Text auto-detection is intentionally limited to UTF-8 then CP1251; use `--encoding` for other known encodings.
 - Safety checks reduce exposure to hostile archives but do not replace operating-system isolation for untrusted input.
+
+## History
+
+ZipSearch is the spiritual successor to `awerpars`, an early archive-search experiment. Its useful ideas evolved here into a more structured engineering tool with source verification, bounded processing, and a deliberately optional index.
 
 ## Development
 
@@ -226,7 +335,7 @@ ruff check .
 python -m build
 ```
 
-Continuous integration runs the test suite and Ruff on Python 3.10, 3.11, and 3.12. See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidance.
+Run the test suite and Ruff before proposing a change. See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidance.
 
 ## Repository layout
 

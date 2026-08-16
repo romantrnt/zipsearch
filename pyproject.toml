@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zipsearch"
-version = "5.0.0"
+version = "6.0.0"
 description = "Search text and structured records inside ZIP archives without bulk extraction."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -19,9 +19,15 @@ classifiers = [
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
   "Topic :: System :: Archiving",
 ]
 keywords = ["zip", "search", "archives", "forensics", "grep"]
+
+[project.urls]
+Homepage = "https://github.com/romantrnt/zipsearch"
+Repository = "https://github.com/romantrnt/zipsearch"
+Issues = "https://github.com/romantrnt/zipsearch/issues"
 
 [project.scripts]
 zipsearch = "zipsearch.cli:main"
